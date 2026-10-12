@@ -267,6 +267,27 @@ Two failure shapes, needing different responses, so they are counted separately:
 the generation never arrives (**timeout-bound**), or it arrives and does not run
 (**broken-code**).
 
+### Live result
+
+Run from the panel against the `a1` route, `reasoningEffort: high`, three complex
+trials per model:
+
+| Model | Control | Complex | Verdict |
+| --- | --- | --- | --- |
+| `a1/gpt-6-astra` | 2/2 | 0/3 (1 generated, threw) | **broken-code** |
+| `a1/gpt-6.1-sol` | 2/2 | 2/3 (1 stream cut short) | **unstable** |
+
+Both models pass the control tier, so neither is simply broken. `gpt-6-astra`
+generated one complex scene out of three, and that one threw
+`Cannot read properties of undefined (reading 'position')` — a matrix-stack bug
+that only appears in the large program. `gpt-6.1-sol` rendered two of three.
+
+Note the two ways a trial fails here: an uncaught error in the generated code,
+and `OpenAI Responses stream ended before a terminal response event`. The second
+is the gateway cutting a long generation short, which is why the battery reports
+generated-count separately from rendered-count instead of collapsing them into
+one pass/fail.
+
 ### Two measurement traps worth recording
 
 Both produced wrong answers before they were fixed, and both are regression-tested:
