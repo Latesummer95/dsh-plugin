@@ -1,10 +1,10 @@
 {
-  "name": "dsh-degradation-probe",
+  "name": "dsh-coding-probe",
   "version": "1.0.0",
   "private": true,
   "type": "module",
   "main": "index.js",
-  "description": "Sidebar panel that probes a model route for silent degradation (swapped model or capped reasoning) using independently verifiable problems",
+  "description": "Sidebar panel that measures high-complexity code generation by executing generated programs and grading their observable behaviour",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

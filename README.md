@@ -25,10 +25,11 @@ rather than in any one application.
 | --- | --- |
 | [`dsh-llm-loop-guard`](packages/dsh-llm-loop-guard) | Detect the degenerate cycle mid-stream, abort that attempt with a retryable failure, and let `dsh-llm-retry` replay the step |
 | [`dsh-goal-autoresume`](packages/dsh-goal-autoresume) | Re-arm an armed goal after a bounded number of loop-guard failures, so an unattended run does not silently stop |
-| [`dsh-degradation-probe`](packages/dsh-degradation-probe) | Sidebar panel that measures whether a route has been silently weakened, and says *which* way |
+| [`dsh-coding-probe`](packages/dsh-coding-probe) | Sidebar panel that measures high-complexity code generation by **executing** what the model writes |
 
 The first two protect a session. The third answers the question they cannot: not
-"did this request fail" but "is this route still as capable as it was".
+"did this request fail" but "is this route still as capable as it was" — and it
+answers it by running the generated code, not by reading it.
 
 ## Why the loop guard is enough to protect a session
 
@@ -65,7 +66,7 @@ re-arms the goal for loop-guard failures only, bounded per goal.
 ```sh
 cp -r packages/dsh-llm-loop-guard      ~/.dsh/profiles/<profile>/node_modules/
 cp -r packages/dsh-goal-autoresume     ~/.dsh/profiles/<profile>/node_modules/
-cp -r packages/dsh-degradation-probe   ~/.dsh/profiles/<profile>/node_modules/
+cp -r packages/dsh-coding-probe        ~/.dsh/profiles/<profile>/node_modules/
 ```
 
 Then in that profile's `cordis.patch.yml`:
@@ -76,11 +77,15 @@ Then in that profile's `cordis.patch.yml`:
       name: dsh-llm-loop-guard
     - id: goal-autoresume
       name: dsh-goal-autoresume
-    - id: degradation-probe
-      name: dsh-degradation-probe
+    - id: coding-probe
+      name: dsh-coding-probe
+      config:
+        provider: a1
+        modelPattern: gpt-6
+        complexTrials: 3
 ```
 
-Restart the profile to load them. `dsh-degradation-probe` adds a **降智检测**
+Restart the profile to load them. `dsh-coding-probe` adds a **编码能力检测**
 item to the left sidebar.
 
 ## Recommended configuration
@@ -145,7 +150,7 @@ Each package is self-contained with no external dependencies:
 ```sh
 cd packages/dsh-llm-loop-guard     && npm test   # 33 assertions
 cd packages/dsh-goal-autoresume    && npm test   # 11 assertions
-cd packages/dsh-degradation-probe  && npm test   # 45 assertions
+cd packages/dsh-coding-probe      && npm test   # 40 assertions
 ```
 
 `packages/dsh-llm-loop-guard/test/fixture-degenerate.txt` is a real 15 KB sample
@@ -225,22 +230,53 @@ real `contextWindow` costs nothing.
 
 ## What the probe found
 
-Run inside a live profile against the `a1` route, `reasoningEffort: high`:
+The first version of this panel asked hard *arithmetic and combinatorics*
+questions. It was wrong, and the way it was wrong is the reason the shipped
+version executes code instead.
 
-| Model | Score | easy | medium | hard | Verdict |
-| --- | --- | --- | --- | --- | --- |
-| `a1/gpt-6.1-sol` | 8/8 | 3/3 | 1/1 | 4/4 | **healthy** |
-| `a1/gpt-6-astra` | 7/8 | 3/3 | 1/1 | 3/4 | **capped** |
+Measured on the `a1` route with that battery:
 
-`gpt-6-astra` missed `digitsum` (answered 136 for the digit sum of 2^1000, which
-is 1366) while passing every easy and medium item. That is the exact shape the
-tier split exists to expose: a route that looks fine on ordinary prompts and
-slips on the one item needing sustained computation.
+| Model | Score | easy | medium | hard |
+| --- | --- | --- | --- | --- |
+| `a1/gpt-6.1-sol` | 8/8 | 3/3 | 1/1 | 4/4 |
+| `a1/gpt-6-astra` | 7/8 | 3/3 | 1/1 | 3/4 |
 
-This is also why the probe is not "eight hard problems". The same investigation
-that produced this panel found the earlier, coarser probes — a pelican SVG, a
-capybara drawing, a page of hard arithmetic — all reported *no* degradation on
-routes that were in fact degraded. Only the tiered battery separated them.
+Both scored at or near perfect — and both were, at the same time, shipping 3D
+scenes that rendered black. The arithmetic was a clean bill of health for a route
+that could not produce working code. A probe that does not execute anything
+measures reasoning, and reasoning was never what degraded.
+
+The shipped battery executes. Feeding the captured artifacts through it:
+
+| Artifact | Result | Evidence |
+| --- | --- | --- |
+| `pelican-express.html` (2026-09-20, hand-written engine) | pass | non-black 11%, 300 colours, 780x437 |
+| captured complex scene (70 KB) | **fail** | `TypeError: gl.createVertexArray is not a function`, non-black 0%, canvas stuck at 300x150 |
+
+The failure is **complexity-dependent and intermittent**, and both properties are
+load-bearing:
+
+- A 64x64 triangle probe *passes* on the route that cannot produce a working
+  40 KB scene. A probe that is too small reports "healthy" for a degraded route.
+- Repeating the same complex brief three times, only **1 of 3** generations
+  completed; the rest died at the gateway (HTTP 524 at ~120 s). A single trial
+  cannot measure a rate, which is why the target probe repeats.
+- The one attempt that did complete still shipped the `createVertexArray` bug.
+
+Two failure shapes, needing different responses, so they are counted separately:
+the generation never arrives (**timeout-bound**), or it arrives and does not run
+(**broken-code**).
+
+### Two measurement traps worth recording
+
+Both produced wrong answers before they were fixed, and both are regression-tested:
+
+- **"No exception" is not "rendered".** The captured 40 KB failure threw nothing
+  and painted nothing. Grading on exceptions alone passed it. A render now counts
+  only if the canvas is non-black with real colour spread.
+- **Sampling too early reads a black canvas.** The good 2026-09-20 scene still
+  measured black at 800 ms and rendered fully by 2500 ms. The default sample delay
+  is 3 s.
 
 ## Known limitations
 
