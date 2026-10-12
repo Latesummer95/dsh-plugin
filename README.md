@@ -1,7 +1,8 @@
 # dsh-plugin
 
-Two local plugins for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
-that keep a **degeneration-prone model route usable for unattended work**.
+Local plugins for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+that keep a **degeneration-prone model route usable for unattended work** — and
+measure whether it still is.
 
 Written against a specific failure: the `a1` route
 (`https://input.codes/v1`, `deepseek-v4.1-flash`) intermittently collapses into
@@ -24,9 +25,10 @@ rather than in any one application.
 | --- | --- |
 | [`dsh-llm-loop-guard`](packages/dsh-llm-loop-guard) | Detect the degenerate cycle mid-stream, abort that attempt with a retryable failure, and let `dsh-llm-retry` replay the step |
 | [`dsh-goal-autoresume`](packages/dsh-goal-autoresume) | Re-arm an armed goal after a bounded number of loop-guard failures, so an unattended run does not silently stop |
+| [`dsh-degradation-probe`](packages/dsh-degradation-probe) | Sidebar panel that measures whether a route has been silently weakened, and says *which* way |
 
-They are designed to be used together with a larger retry budget; see
-[Recommended configuration](#recommended-configuration).
+The first two protect a session. The third answers the question they cannot: not
+"did this request fail" but "is this route still as capable as it was".
 
 ## Why the loop guard is enough to protect a session
 
@@ -61,8 +63,9 @@ re-arms the goal for loop-guard failures only, bounded per goal.
 ## Install
 
 ```sh
-cp -r packages/dsh-llm-loop-guard  ~/.dsh/profiles/<profile>/node_modules/
-cp -r packages/dsh-goal-autoresume ~/.dsh/profiles/<profile>/node_modules/
+cp -r packages/dsh-llm-loop-guard      ~/.dsh/profiles/<profile>/node_modules/
+cp -r packages/dsh-goal-autoresume     ~/.dsh/profiles/<profile>/node_modules/
+cp -r packages/dsh-degradation-probe   ~/.dsh/profiles/<profile>/node_modules/
 ```
 
 Then in that profile's `cordis.patch.yml`:
@@ -73,9 +76,12 @@ Then in that profile's `cordis.patch.yml`:
       name: dsh-llm-loop-guard
     - id: goal-autoresume
       name: dsh-goal-autoresume
+    - id: degradation-probe
+      name: dsh-degradation-probe
 ```
 
-Restart the profile to load them.
+Restart the profile to load them. `dsh-degradation-probe` adds a **降智检测**
+item to the left sidebar.
 
 ## Recommended configuration
 
@@ -137,8 +143,9 @@ therefore invisible to the cycle detector.
 Each package is self-contained with no external dependencies:
 
 ```sh
-cd packages/dsh-llm-loop-guard  && npm test   # 33 assertions
-cd packages/dsh-goal-autoresume && npm test   # 11 assertions
+cd packages/dsh-llm-loop-guard     && npm test   # 33 assertions
+cd packages/dsh-goal-autoresume    && npm test   # 11 assertions
+cd packages/dsh-degradation-probe  && npm test   # 45 assertions
 ```
 
 `packages/dsh-llm-loop-guard/test/fixture-degenerate.txt` is a real 15 KB sample
@@ -215,6 +222,25 @@ Verified end-to-end in a live headless run at two thresholds against the same
 The threshold is honored precisely, and the reactive path on
 `CONTEXT_WINDOW_EXCEEDED` still covers a hard overflow, so declaring the route's
 real `contextWindow` costs nothing.
+
+## What the probe found
+
+Run inside a live profile against the `a1` route, `reasoningEffort: high`:
+
+| Model | Score | easy | medium | hard | Verdict |
+| --- | --- | --- | --- | --- | --- |
+| `a1/gpt-6.1-sol` | 8/8 | 3/3 | 1/1 | 4/4 | **healthy** |
+| `a1/gpt-6-astra` | 7/8 | 3/3 | 1/1 | 3/4 | **capped** |
+
+`gpt-6-astra` missed `digitsum` (answered 136 for the digit sum of 2^1000, which
+is 1366) while passing every easy and medium item. That is the exact shape the
+tier split exists to expose: a route that looks fine on ordinary prompts and
+slips on the one item needing sustained computation.
+
+This is also why the probe is not "eight hard problems". The same investigation
+that produced this panel found the earlier, coarser probes — a pelican SVG, a
+capybara drawing, a page of hard arithmetic — all reported *no* degradation on
+routes that were in fact degraded. Only the tiered battery separated them.
 
 ## Known limitations
 
