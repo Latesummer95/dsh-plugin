@@ -1,0 +1,11 @@
+{
+  "name": "dsh-goal-autoresume",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "Re-arm an armed goal after a bounded number of loop-guard step failures so unattended runs keep going",
+  "scripts": {
+    "test": "node test/test-autoresume.mjs"
+  }
+}

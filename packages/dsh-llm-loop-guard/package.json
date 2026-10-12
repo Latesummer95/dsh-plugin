@@ -1,0 +1,11 @@
+{
+  "name": "dsh-llm-loop-guard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "Abort degenerate repetition in an LLM stream and let the retry executor replay the step",
+  "scripts": {
+    "test": "node test/test-loop-guard.mjs && node test/test-loop-guard-stream.mjs"
+  }
+}
