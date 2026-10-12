@@ -50,6 +50,14 @@ const DEFAULTS = {
 	probeChars: 48,
 	/** Rolling window retained for detection; must exceed minRepeatedChars. */
 	bufferChars: 16384,
+	/**
+	 * Backstop against a runaway that is NOT repetitive, and therefore invisible to
+	 * the cycle detector: abort once one attempt has produced this many characters
+	 * of watched output. The largest legitimate reasoning block measured on this
+	 * route was ~39k characters, so this leaves a wide margin, while the observed
+	 * degenerate block reached 217k. Set to 0 to disable.
+	 */
+	maxAttemptChars: 120000,
 	/** Watch the reasoning channel (where this route degenerates). */
 	watchReasoning: true,
 	/** Watch the visible text channel as well. */
@@ -132,14 +140,26 @@ function detectCycle(buf, cfg) {
  * Build a stateful observer for one model call.
  *
  * @param cfg - resolved guard configuration.
- * @returns a function folding one delta into the window and reporting a cycle.
+ * @returns a function folding one delta into the window and reporting a trip
+ *   (`{kind: "cycle", ...}` / `{kind: "length", ...}`), or `null` while healthy.
  */
 function createObserver(cfg) {
 	let buf = "";
+	let total = 0;
 	return (text) => {
+		total += text.length;
 		buf += text;
 		if (buf.length > cfg.bufferChars) buf = buf.slice(-cfg.bufferChars);
-		return detectCycle(buf, cfg);
+		const cycle = detectCycle(buf, cfg);
+		if (cycle !== null) return {
+			kind: "cycle",
+			...cycle
+		};
+		if (cfg.maxAttemptChars > 0 && total > cfg.maxAttemptChars) return {
+			kind: "length",
+			chars: total
+		};
+		return null;
 	};
 }
 
@@ -184,13 +204,14 @@ function guardStream(source, cfg, onTrip) {
 				if (trip !== null) {
 					await close();
 					onTrip(trip);
+					const detail = trip.kind === "cycle" ? `degenerate repetition detected (${trip.repeats} consecutive ${trip.cycleChars}-char cycles)` : `runaway output detected (${trip.chars} characters in one attempt, limit ${cfg.maxAttemptChars})`;
 					yield {
 						type: "finish",
 						reason: {
 							kind: "error",
 							failure: {
 								code: cfg.failureCode,
-								message: `llm-loop-guard: degenerate repetition detected (${trip.repeats} consecutive ${trip.cycleChars}-char cycles); this attempt was discarded so the step can be retried`
+								message: `llm-loop-guard: ${detail}; this attempt was discarded so the step can be retried`
 							}
 						}
 					};
@@ -219,12 +240,8 @@ function apply(ctx, config = {}) {
 		const stream = next();
 		// `next()` may hand back a promise of the iterable; normalize both shapes.
 		return guardStream(stream, cfg, (trip) => {
-			ctx.logger?.warn(
-				"llm-loop-guard: aborted a degenerate stream (%d consecutive %d-char cycles, sample %o); retrying the step",
-				trip.repeats,
-				trip.cycleChars,
-				trip.sample.slice(0, 80)
-			);
+			if (trip.kind === "cycle") ctx.logger?.warn("llm-loop-guard: aborted a degenerate stream (%d consecutive %d-char cycles, sample %o); retrying the step", trip.repeats, trip.cycleChars, trip.sample.slice(0, 80));
+			else ctx.logger?.warn("llm-loop-guard: aborted a runaway stream (%d characters in one attempt, limit %d); retrying the step", trip.chars, cfg.maxAttemptChars);
 		});
 	}, { global: true });
 }

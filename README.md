@@ -103,24 +103,33 @@ retry budget is what makes the guard useful for unattended runs:
             jitterRatio: 0.2
         models:
           - id: <your-model>
-            # Compaction fires at contextWindow * 0.8. The nested compaction entry
-            # cannot be patched from a user layer (see the loop-guard README), so
-            # declare a smaller window to make automatic compaction actually fire.
-            contextWindow: 300000
-            maxTokens: 64000
+            # Declare the route's real capacity. Do NOT shrink it as a way to make
+            # compaction fire: the window bound is recoverable, because
+            # compaction-basic also listens on agent/request-error and turns a
+            # CONTEXT_WINDOW_EXCEEDED into compactIfNeeded + retry
+            # (maxOverflowRetries, default 1).
+            contextWindow: 1000000
+            maxTokens: 256000
 ```
 
-Also drop `reasoningEffort` a level (e.g. `high` -> `medium`). The degeneration
-grows out of long reasoning chains, and the measured failures all landed on the
-**final step of a turn**, when the model is deliberating about writing its
-conclusion.
+Leave `reasoningEffort` where your work needs it. A lower level reduces how much
+deliberation precedes the turn's final answer, and every measured failure landed
+on the **final step of a turn** — but that link was never measured against a
+`high`/`medium` control, so treat it as a lever to reach for if the retry logs
+show frequent trips, not as a requirement.
+
+Do not shrink `maxTokens` as a backstop either: the guard already bounds an
+attempt, and a character budget would truncate genuine high-effort reasoning.
+`dsh-llm-loop-guard` carries its own `maxAttemptChars` backstop (default 120000
+characters of watched output) for a runaway that is *not* repetitive and
+therefore invisible to the cycle detector.
 
 ## Tests
 
 Each package is self-contained with no external dependencies:
 
 ```sh
-cd packages/dsh-llm-loop-guard  && npm test   # 25 assertions
+cd packages/dsh-llm-loop-guard  && npm test   # 33 assertions
 cd packages/dsh-goal-autoresume && npm test   # 11 assertions
 ```
 

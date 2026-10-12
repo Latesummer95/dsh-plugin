@@ -92,6 +92,7 @@ Passed through the `insert` entry in the profile patch layer. Defaults:
 | `minRepeatedChars` | `2048` | minimum total span of verbatim repetition |
 | `probeChars` | `48` | tail probe length used to find candidate cycles |
 | `bufferChars` | `16384` | rolling detection window; must exceed `minRepeatedChars` |
+| `maxAttemptChars` | `120000` | backstop for a runaway that is *not* repetitive; `0` disables |
 | `watchReasoning` | `true` | watch the reasoning channel |
 | `watchText` | `false` | watch the visible text channel |
 | `failureCode` | `SERVER` | retryable code on the synthetic failure |
@@ -103,12 +104,41 @@ regardless of cycle length while still requiring many repeats for short cycles.
 Measured against the real captured response, the detection point is **8,888
 characters** instead of the full 67,839.
 
+### Two independent trip conditions
+
+The cycle detector only sees **repetition**. A model can also run away without
+repeating itself, and the cycle check would never fire. `maxAttemptChars` covers
+that case: it counts the watched output of one attempt and aborts once the total
+exceeds the limit, regardless of shape.
+
+The default is deliberately loose. The largest *legitimate* reasoning block
+measured on this route was ~39k characters, while the observed degenerate block
+reached 217k, so 120k separates them with a wide margin on both sides. Raise it if
+your work legitimately produces very long single reasoning steps; set it to `0`
+only if you are content for a non-repetitive runaway to reach the provider's own
+`maxTokens` ceiling.
+
 ## Caveat
 
 This is a **safety net, not a cure**. It bounds the damage of a gateway-side
 degeneration; it does not stop the model from degenerating. If every retry
-degenerates, the step fails cleanly after `maxRetries` (5 by default) with the
-guard's message, and the session stays clean.
+degenerates, the step fails cleanly once the provider's `retryPolicy.maxRetries`
+is exhausted, with the guard's message, and the session stays clean.
+
+### A note on the compaction threshold
+
+Automatic compaction (`dsh-compaction-basic`) triggers at `contextWindow * 0.8`,
+and its live entry is nested inside a `cordis:group`, which a user patch layer
+cannot target: `applyEntryPatches` keys its map by **bare id** and recurses into
+groups, so the duplicate `compaction-basic` entries overwrite each other and a
+patch lands on the wrong one. Both a bare and a `parent:child` form were tried,
+and a control target from another group failed identically.
+
+Shrinking `contextWindow` to force an earlier trigger is **not** the answer. The
+window bound is recoverable: `compaction-basic` also listens on
+`agent/request-error` and turns a `CONTEXT_WINDOW_EXCEEDED` into
+`compactIfNeeded` + retry (`maxOverflowRetries`, default 1). Declare the route's
+real capacity and let reactive compaction handle the overflow.
 
 The package lives in the profile's `node_modules` by hand. A future
 `dsh plugin` / `pnpm install` in the profile directory may prune it; reinstall by

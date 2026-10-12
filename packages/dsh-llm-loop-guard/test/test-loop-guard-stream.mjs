@@ -97,5 +97,52 @@ console.log("== promise-returning next(): must still work ==");
   check("resolved promise source and forwarded chunks", out.length === 2);
 }
 
+console.log("== non-repetitive runaway: the length backstop must trip ==");
+{
+  const state = { closed: false };
+  const chunks = [{ type: "block-start", index: 0, blockType: "reasoning" }];
+  // Distinct text every delta, so the cycle detector can never match; only the
+  // character budget can stop this.
+  let n = 0;
+  const seen = new Set();
+  while (n < 200000) {
+    const piece = `token${n.toString(36)}${String.fromCharCode(97 + (n % 26))} `;
+    if (seen.has(piece)) throw new Error("test generator produced a repeat");
+    seen.add(piece);
+    chunks.push({ type: "reasoning-delta", index: 0, text: piece });
+    n += piece.length;
+  }
+  chunks.push({ type: "finish", reason: { kind: "stop" } });
+  const logsBefore = logs.length;
+  const stream = listener({}, () => makeSource(chunks, state));
+  const out = [];
+  for await (const c of stream) out.push(c);
+  const last = out[out.length - 1];
+  check("terminal chunk is a finish", last?.type === "finish");
+  check("finish reason is error", last?.reason?.kind === "error");
+  check("failure names a runaway, not a cycle", last?.reason?.failure?.message.includes("runaway output detected"), last?.reason?.failure?.message);
+  check("stopped before the full stream", out.length < chunks.length, `${out.length} of ${chunks.length}`);
+  check("upstream closed", state.closed === true);
+  check("logged a runaway warning", logs.length === logsBefore + 1 && logs[logs.length - 1].includes("runaway"));
+}
+
+console.log("== a long but bounded attempt is left alone ==");
+{
+  const state = { closed: false };
+  const chunks = [{ type: "block-start", index: 0, blockType: "reasoning" }];
+  let n = 0;
+  while (n < 60000) {
+    const piece = `w${n.toString(36)} `;
+    chunks.push({ type: "reasoning-delta", index: 0, text: piece });
+    n += piece.length;
+  }
+  chunks.push({ type: "finish", reason: { kind: "stop" } });
+  const stream = listener({}, () => makeSource(chunks, state));
+  const out = [];
+  for await (const c of stream) out.push(c);
+  check("60000 characters passes through (below the 120000 limit)", out.length === chunks.length);
+  check("finish reason preserved", out[out.length - 1].reason.kind === "stop");
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
