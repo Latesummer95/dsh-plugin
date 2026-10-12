@@ -110,6 +110,14 @@ retry budget is what makes the guard useful for unattended runs:
             # (maxOverflowRetries, default 1).
             contextWindow: 1000000
             maxTokens: 256000
+# Compact while there is still room, instead of at the window. See
+# "Configuring the compaction threshold" for why this re-enables the root entry.
+- id: compaction-basic
+  name: "@deepseek-ai/dsh-compaction-basic"
+  disabled: false
+  config:
+    thresholdRatio: 0.2
+    retainRatio: 0.08
 ```
 
 Leave `reasoningEffort` where your work needs it. A lower level reduces how much
@@ -140,6 +148,74 @@ first release of the guard passed synthetic tests and still never fired in
 production, because the real cycle is 632 characters long and the guessed bounds
 were far too small.
 
+## Configuring the compaction threshold
+
+The built-in auto-compaction trigger is `contextWindow * thresholdRatio`
+(`0.8` by default) — about 800k tokens on a 1M route, so a long session climbs
+to the window before anything happens. Setting that threshold is the one
+configuration problem this repo ran into that a plugin **cannot** solve, and the
+reason is worth recording.
+
+**The live entry is unreachable from a profile patch layer.** In the `web`
+profile, `@deepseek-ai/dsh-web-app` disables the root-level `compaction-basic` and
+moves compaction into the agent-preset subtrees:
+
+```
+- id: preset-standard          <- top-level, but an unrecognized carrier
+      - id: compaction         <- the live group is in here
+            - id: compaction-basic
+- id: preset-ptc
+      - id: compaction
+- id: preset-cordis
+      - id: compaction
+```
+
+Presets arrive through `cordis:include`, and patch targets explicitly exclude
+include descendants, so `applyEntryPatches`' map never descends into them. The
+failure modes differ but none work:
+
+| Patch attempt | Result |
+| --- | --- |
+| `insert` with `id: compaction` | `patch insert: entry "compaction" not found` |
+| `id: compaction:compaction-basic` | `patch: entry "..." not found` — that map is keyed by bare id only |
+| `id: compaction-basic` | resolves, but to the **disabled** root entry, so it is inert |
+
+**A plugin cannot reach the service either.** The preset group declares
+`isolate: { compaction: true }`, and `isolate` works by mapping a service name to
+a realm-local Symbol (`Symbol("compaction@...")` versus `Symbol("compaction")`).
+A plugin mounted outside that realm resolves `ctx.compaction` to a different
+symbol, so it cannot call `compactNow` on the live engine. This was verified by
+building exactly such a plugin, testing it, and then discovering the realm
+boundary — it is the wrong tool here, not an untested idea.
+
+**What works.** Re-enable the *root-level* `compaction-basic`, which is a valid
+patch target, and give it the threshold:
+
+```yaml
+- id: compaction-basic
+  name: "@deepseek-ai/dsh-compaction-basic"
+  disabled: false
+  config:
+    thresholdRatio: 0.2
+    retainRatio: 0.08
+```
+
+Root-scope `agent/pre-step` listeners do receive agent events — `dsh-goal-round-driver`
+depends on that — so this instance runs for every preset tree. It is a *second*
+compactor beside the preset's own, which stays at `0.8` and so never fires.
+
+Verified end-to-end in a live headless run at two thresholds against the same
+~12.9k-token context:
+
+| `thresholdRatio` | Trigger | Observed |
+| --- | --- | --- |
+| `0.02` (20k tokens) | not reached | **no** compaction — correct |
+| `0.005` (5k tokens) | exceeded | `compaction/prune` shadowed 12491 tokens, then `compaction/start` → `summary` → `end` |
+
+The threshold is honored precisely, and the reactive path on
+`CONTEXT_WINDOW_EXCEEDED` still covers a hard overflow, so declaring the route's
+real `contextWindow` costs nothing.
+
 ## Known limitations
 
 - **The guard is a safety net, not a cure.** It bounds the damage of a
@@ -152,3 +228,6 @@ were far too small.
 - **Auto-resume is bounded on purpose.** If the budget warning appears on every
   step, the route is persistently broken rather than intermittently degenerating;
   that is a signal to change routes, not to raise the bound.
+- **The compaction threshold is a ratio, not an absolute.** There is no supported
+  way to say "compact at 200k tokens" independent of `contextWindow`; you express
+  it as `thresholdRatio` against whatever window the route declares.
