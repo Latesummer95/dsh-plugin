@@ -26,10 +26,15 @@ rather than in any one application.
 | [`dsh-llm-loop-guard`](packages/dsh-llm-loop-guard) | Detect the degenerate cycle mid-stream, abort that attempt with a retryable failure, and let `dsh-llm-retry` replay the step |
 | [`dsh-goal-autoresume`](packages/dsh-goal-autoresume) | Re-arm an armed goal after a bounded number of loop-guard failures, so an unattended run does not silently stop |
 | [`dsh-coding-probe`](packages/dsh-coding-probe) | Sidebar panel that measures high-complexity code generation by **executing** what the model writes |
+| [`dsh-fingerprint-probe`](packages/dsh-fingerprint-probe) | Sidebar panel that identifies which model a route actually serves, by comparing its number-choice distribution against a reference bank of 58 models |
 
-The first two protect a session. The third answers the question they cannot: not
-"did this request fail" but "is this route still as capable as it was" — and it
-answers it by running the generated code, not by reading it.
+The first two protect a session. The last two answer the question they cannot:
+not "did this request fail" but "is this route still what it claims to be" — the
+coding probe by running the generated code, the fingerprint probe by measuring
+the model's own value distribution. They are complementary: a relay that quietly
+substitutes a cheaper model can keep simple code generation working while
+changing the value distribution completely, and a route can pass either check
+while failing the other.
 
 ## Why the loop guard is enough to protect a session
 
@@ -67,6 +72,7 @@ re-arms the goal for loop-guard failures only, bounded per goal.
 cp -r packages/dsh-llm-loop-guard      ~/.dsh/profiles/<profile>/node_modules/
 cp -r packages/dsh-goal-autoresume     ~/.dsh/profiles/<profile>/node_modules/
 cp -r packages/dsh-coding-probe        ~/.dsh/profiles/<profile>/node_modules/
+cp -r packages/dsh-fingerprint-probe   ~/.dsh/profiles/<profile>/node_modules/
 ```
 
 Then in that profile's `cordis.patch.yml`:
@@ -83,10 +89,27 @@ Then in that profile's `cordis.patch.yml`:
         provider: a1
         modelPattern: gpt-6
         complexTrials: 3
+    - id: fingerprint-probe
+      name: dsh-fingerprint-probe
+      config:
+        provider: a1
+        modelPattern: gpt-6
+        reasoningEffort: null   # omit the field rather than guess a level
 ```
 
 Restart the profile to load them. `dsh-coding-probe` adds a **编码能力检测**
-item to the left sidebar.
+item to the left sidebar, and `dsh-fingerprint-probe` adds **模型指纹检测**
+directly below it.
+
+> Adding a plugin needs a restart: the profile patch watcher applies *edits to
+> already-mounted* entries, but a newly inserted plugin is only picked up at boot.
+> That is why both panels are absent until the profile is restarted.
+
+`dsh-fingerprint-probe` downloads a 4.1 MB detector on first use and caches it
+under `$DSH_HOME/cache/fingerprint-probe/`, verified against a pinned SHA-256.
+Its reference bank is a **closed set of 58 models** — a model outside that set
+still receives a nearest candidate and a confidence share, so read the result as
+"closest match in the bank", not as proof of identity.
 
 ## Recommended configuration
 

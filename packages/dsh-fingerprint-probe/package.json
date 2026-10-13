@@ -1,0 +1,30 @@
+{
+  "name": "dsh-fingerprint-probe",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "Sidebar panel that identifies which model an API route actually serves by comparing its number-choice distribution against a reference bank",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node test/test-detector.mjs",
+    "fetch-data": "node test/fetch-fixtures.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,3 +1,7 @@
 node_modules/
 *.log
 .DS_Store
+
+# Fetched test fixtures. Too large to vendor; `npm run fetch-data` restores them
+# and the checksum in test/fetch-fixtures.mjs pins exactly which revision.
+packages/*/test/fixtures/
