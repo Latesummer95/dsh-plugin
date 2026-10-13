@@ -345,8 +345,77 @@ await test("GET on the run route reports the plan without probing", async () => 
 	await routes.get(`${ROUTE_PREFIX}/run`).handler(fakeRequest("GET"), res);
 	assert.equal(res.record.statusCode, 200);
 	const payload = JSON.parse(res.record.body);
+	assert.equal(payload.phase, "idle", "nothing has run yet");
 	assert.deepEqual(payload.targets, ["a1/gpt-6-astra", "a1/gpt-6-sol"]);
 	assert.ok(payload.upstream.commit, "the plan must name the pinned upstream commit");
+});
+
+await test("a POST acknowledges the start without waiting for the detection", async () => {
+	// The regression this guards: POST used to run the whole detection inline
+	// and only reply when it finished, so the run belonged to an HTTP request
+	// whose reader is gone the moment the panel unmounts. A conversation switch
+	// then discarded minutes of work and the panel came back looking idle.
+	let released;
+	const held = new Promise((resolve) => { released = resolve; });
+	const { routes } = mountRoutes({
+		llm: {
+			listProviders: () => [{ id: "a1" }],
+			listModels: async () => [{ id: "gpt-6-astra" }],
+			// Never settles until the test releases it: if the handler awaited the
+			// detection, this await would hang and the test would time out.
+			stream: async function* () { await held; yield { type: "text-delta", text: "1 2 3" }; yield { type: "finish", reason: { kind: "stop" } }; }
+		}
+	}, { provider: "a1", modelPattern: "gpt-6", spacingMs: 0 });
+	const res = fakeResponse();
+	await routes.get(`${ROUTE_PREFIX}/run`).handler(fakeRequest("POST", { models: ["a1/gpt-6-astra"] }), res);
+	const payload = JSON.parse(res.record.body);
+	assert.equal(res.record.statusCode, 202, "a started job is accepted, not completed");
+	assert.equal(payload.phase, "running");
+	assert.ok(typeof payload.id === "string" && payload.id.length > 0, "the job must be identifiable");
+	released();
+});
+
+await test("GET reports the running job so a remounted panel can rejoin it", async () => {
+	// This is the whole fix for "switching conversations asks me to start over":
+	// the job lives on the host, so a panel that mounts mid-run reads it back.
+	let released;
+	const held = new Promise((resolve) => { released = resolve; });
+	const { routes } = mountRoutes({
+		llm: {
+			listProviders: () => [{ id: "a1" }],
+			listModels: async () => [{ id: "gpt-6-astra" }],
+			stream: async function* () { await held; yield { type: "text-delta", text: "1 2 3" }; yield { type: "finish", reason: { kind: "stop" } }; }
+		}
+	}, { provider: "a1", modelPattern: "gpt-6", spacingMs: 0 });
+	await routes.get(`${ROUTE_PREFIX}/run`).handler(fakeRequest("POST", { models: ["a1/gpt-6-astra"] }), fakeResponse());
+
+	const res = fakeResponse();
+	await routes.get(`${ROUTE_PREFIX}/run`).handler(fakeRequest("GET"), res);
+	const payload = JSON.parse(res.record.body);
+	assert.equal(payload.phase, "running", "GET must report the in-flight job, not idle");
+	assert.deepEqual(payload.targets, ["a1/gpt-6-astra"], "the manifest must describe the running job");
+	released();
+});
+
+await test("a second POST supersedes the first job", async () => {
+	let released;
+	const held = new Promise((resolve) => { released = resolve; });
+	const { routes } = mountRoutes({
+		llm: {
+			listProviders: () => [{ id: "a1" }],
+			listModels: async () => [{ id: "gpt-6-astra" }],
+			stream: async function* () { await held; yield { type: "text-delta", text: "1 2 3" }; yield { type: "finish", reason: { kind: "stop" } }; }
+		}
+	}, { provider: "a1", modelPattern: "gpt-6", spacingMs: 0 });
+	const first = fakeResponse();
+	await routes.get(`${ROUTE_PREFIX}/run`).handler(fakeRequest("POST", { models: ["a1/first"] }), first);
+	const second = fakeResponse();
+	await routes.get(`${ROUTE_PREFIX}/run`).handler(fakeRequest("POST", { models: ["a1/second"] }), second);
+	assert.notEqual(JSON.parse(first.record.body).id, JSON.parse(second.record.body).id, "each run gets its own id");
+	const res = fakeResponse();
+	await routes.get(`${ROUTE_PREFIX}/run`).handler(fakeRequest("GET"), res);
+	assert.deepEqual(JSON.parse(res.record.body).targets, ["a1/second"], "GET follows the newest job");
+	released();
 });
 
 await test("the models route lists the reference bank without downloading it", async () => {

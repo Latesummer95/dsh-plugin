@@ -54,11 +54,47 @@ window.__ModuleLoader__.load({
 			complex: "复杂任务×N"
 		};
 
-		/** Resolve a document-relative URL so the app works under any mount point. */
+		/**
+		 * Resolve a document-relative URL so the app works under any mount point.
+		 *
+		 * @param path - the route-relative path.
+		 * @returns the resolved pathname.
+		 */
 		function api(path) {
 			const relative = String(path).replace(/^\/+/, "");
 			if (typeof document === "undefined") return `/${relative}`;
 			return new URL(relative, document.baseURI).pathname;
+		}
+
+		/**
+		 * Module-scoped panel state, kept outside React on purpose.
+		 *
+		 * The main slot renders one panel at a time, and the workspace clears the
+		 * active panel whenever the session changes. React state therefore dies
+		 * on every conversation switch, which used to throw away the ticked
+		 * models *and* the finished report — the panel came back as though it had
+		 * never run. Hoisting the state here makes the switch invisible.
+		 */
+		const panelState = {
+			/** Ticked `provider/model` ids, or `null` until the catalog loads. */
+			selected: null,
+			/** `idle` | `running` | `done` | `error`. */
+			phase: "idle",
+			/** The last report returned by the host, or `null`. */
+			report: null,
+			/** A transport failure, kept apart from a probe verdict. */
+			error: null,
+			/** The host job id being polled, so a stale poll cannot overwrite. */
+			jobId: null
+		};
+
+		/** Subscribers re-rendered when {@link panelState} changes. */
+		const panelListeners = new Set();
+
+		/** Apply a partial update and notify every mounted panel. */
+		function setPanelState(patch) {
+			Object.assign(panelState, patch);
+			for (const listener of panelListeners) listener();
 		}
 
 		/** Inline styles keep the panel self-contained with no CSS asset to ship. */
@@ -238,11 +274,18 @@ window.__ModuleLoader__.load({
 		 * @returns the panel element.
 		 */
 		function ProbePanel() {
-			const [state, setState] = React.useState({ phase: "idle", report: null, error: null });
+			// Re-render on every store change; the store outlives this component.
+			const [, forceRender] = React.useState(0);
+			React.useEffect(() => {
+				const listener = () => forceRender((n) => n + 1);
+				panelListeners.add(listener);
+				return () => { panelListeners.delete(listener); };
+			}, []);
+
 			const [catalog, setCatalog] = React.useState(null);
 			const [catalogError, setCatalogError] = React.useState(null);
 			const [loadingModels, setLoadingModels] = React.useState(true);
-			const [selected, setSelected] = React.useState(() => new Set());
+			const selected = panelState.selected ?? new Set();
 
 			const loadModels = React.useCallback(async () => {
 				setLoadingModels(true);
@@ -252,9 +295,12 @@ window.__ModuleLoader__.load({
 					const payload = await response.json();
 					if (!response.ok) throw new Error(payload?.error ?? `HTTP ${response.status}`);
 					setCatalog(payload);
-					// Preselect the profile's configured targets so the default
-					// behaviour is unchanged until the user deliberately edits it.
-					setSelected(new Set(payload.defaults ?? []));
+					// Preselect the profile's configured targets, but never
+					// overwrite a selection the user already made — reloading the
+					// catalog (or remounting the panel) must not reset the ticks.
+					if (panelState.selected === null) {
+						setPanelState({ selected: new Set(payload.defaults ?? []) });
+					}
 				} catch (error) {
 					setCatalogError(error instanceof Error ? error.message : String(error));
 				} finally {
@@ -264,36 +310,78 @@ window.__ModuleLoader__.load({
 
 			React.useEffect(() => { loadModels(); }, [loadModels]);
 
+			// Adopt a run already in progress. This is what makes a conversation
+			// switch safe: the host owns the job, so a remounted panel rejoins it
+			// instead of showing an idle frame.
+			const poll = React.useCallback(async () => {
+				try {
+					const response = await fetch(api(ROUTE));
+					const payload = await response.json();
+					if (!response.ok) throw new Error(payload?.error ?? `HTTP ${response.status}`);
+					if (payload.phase === "running") {
+						// Show partial results while the battery continues.
+						setPanelState({ phase: "running", report: payload.models?.length ? payload : panelState.report, jobId: payload.id ?? panelState.jobId, error: null });
+					} else if (payload.phase === "idle") {
+						// The host restarted; a stored report is no longer backed.
+						setPanelState({ phase: "idle", report: null, jobId: null, error: null });
+					} else {
+						setPanelState({
+							phase: payload.phase === "error" ? "error" : "done",
+							report: payload,
+							jobId: null,
+							error: payload.error ?? null
+						});
+					}
+				} catch (error) {
+					setPanelState({ phase: "error", report: null, error: error instanceof Error ? error.message : String(error) });
+				}
+			}, []);
+
+			// Poll only while running, and re-check once on mount so a panel
+			// opened mid-run (or after a session switch) catches up at once.
+			React.useEffect(() => {
+				let cancelled = false;
+				let timer;
+				const tick = async () => {
+					if (cancelled) return;
+					await poll();
+					if (!cancelled && panelState.phase === "running") timer = setTimeout(tick, 3000);
+				};
+				if (panelState.phase === "running") tick();
+				else poll();
+				return () => { cancelled = true; clearTimeout(timer); };
+			}, [poll, panelState.phase]);
+
 			const toggle = React.useCallback((id) => {
-				setSelected((prev) => {
-					const next = new Set(prev);
-					if (next.has(id)) next.delete(id); else next.add(id);
-					return next;
-				});
+				const next = new Set(panelState.selected ?? []);
+				if (next.has(id)) next.delete(id); else next.add(id);
+				setPanelState({ selected: next });
 			}, []);
 			const selectAll = React.useCallback(() => {
-				setSelected(new Set((catalog?.models ?? []).map((m) => `${m.provider}/${m.model}`)));
+				setPanelState({ selected: new Set((catalog?.models ?? []).map((m) => `${m.provider}/${m.model}`)) });
 			}, [catalog]);
-			const selectNone = React.useCallback(() => setSelected(new Set()), []);
+			const selectNone = React.useCallback(() => setPanelState({ selected: new Set() }), []);
 
 			const run = React.useCallback(async () => {
-				setState({ phase: "running", report: null, error: null });
+				setPanelState({ phase: "running", report: null, error: null, jobId: null });
 				try {
 					const response = await fetch(api(ROUTE), {
 						method: "POST",
 						headers: { "content-type": "application/json" },
-						body: JSON.stringify({ models: Array.from(selected) })
+						body: JSON.stringify({ models: Array.from(panelState.selected ?? []) })
 					});
 					const payload = await response.json();
 					if (!response.ok) throw new Error(payload?.error ?? `HTTP ${response.status}`);
-					setState({ phase: "done", report: payload, error: null });
+					// The POST only acknowledges the start; the poll loop above
+					// carries the run to completion, so navigating away now is safe.
+					setPanelState({ jobId: payload.id ?? null });
 				} catch (error) {
-					setState({ phase: "error", report: null, error: error instanceof Error ? error.message : String(error) });
+					setPanelState({ phase: "error", report: null, error: error instanceof Error ? error.message : String(error) });
 				}
-			}, [selected]);
+			}, []);
 
-			const running = state.phase === "running";
-			const report = state.report;
+			const running = panelState.phase === "running";
+			const report = panelState.report;
 			const canRun = !running && !loadingModels && selected.size > 0;
 
 			return React.createElement("div", { style: styles.root },
@@ -322,9 +410,12 @@ window.__ModuleLoader__.load({
 						`共 ${report.models?.length ?? 0} 个模型 · 复杂任务 ${report.complexTrials ?? 1} 次/模型 · 推理档位 ${report.reasoningEffort ?? "默认"}`
 					)
 				),
-				state.error !== null && React.createElement("div", { style: styles.err }, `检测失败：${state.error}`),
-				running && React.createElement("div", { style: styles.empty }, "正在逐个生成并执行代码。复杂任务每次生成可能需要 1–2 分钟，请耐心等待…"),
-				!running && report === null && state.error === null && React.createElement("div", { style: styles.empty }, "选好模型后点击「开始检测」运行探针。"),
+				panelState.error !== null && React.createElement("div", { style: styles.err }, `检测失败：${panelState.error}`),
+				running && React.createElement("div", { style: styles.empty },
+					"正在逐个生成并执行代码。复杂任务每次生成可能需要 1–2 分钟。",
+					"检测在后台进行，可以切到别的对话或别的面板，回来时会自动接上。"
+				),
+				!running && report === null && panelState.error === null && React.createElement("div", { style: styles.empty }, "选好模型后点击「开始检测」运行探针。"),
 				report !== null && report.models?.length === 0 && React.createElement("div", { style: styles.empty }, "没有匹配到模型。请检查插件的 provider / modelPattern 配置。"),
 				(report?.models ?? []).map((model) => React.createElement(ModelCard, { key: `${model.provider}/${model.model}`, model }))
 			);

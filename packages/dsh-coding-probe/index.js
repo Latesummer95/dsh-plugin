@@ -828,10 +828,12 @@ function score(results) {
  * @param ctx - the plugin context.
  * @param targets - the routes to probe.
  * @param config - the resolved plugin config.
+ * @param report - optional live report; each finished model is pushed into it
+ *   as it completes so a polling reader sees partial results.
  * @returns a promise of model reports.
  */
-async function runBattery(ctx, targets, config) {
-	const reports = [];
+async function runBattery(ctx, targets, config, report) {
+	const reports = report?.models ?? [];
 	const queue = [...targets];
 	const worker = async () => {
 		for (;;) {
@@ -853,6 +855,68 @@ async function runBattery(ctx, targets, config) {
 }
 
 /**
+ * Create the single-slot run registry.
+ *
+ * A battery takes minutes, and the panel that started it can be unmounted at
+ * any moment: the main slot renders one panel at a time, and the workspace
+ * clears the active panel when the session changes. Tying the run to the
+ * request that started it would discard the work exactly when it is most
+ * expensive, which is why a conversation switch used to look as though the
+ * probe had never run.
+ *
+ * The registry decouples the two. `start` returns at once, the job keeps
+ * running with no reader attached, and the panel reads progress back through
+ * GET.
+ *
+ * @returns the registry.
+ */
+function createRunRegistry() {
+	let current = null;
+	return {
+		/**
+		 * Start a job and hand back its descriptor immediately.
+		 *
+		 * @param manifest - the run's manifest, echoed into the report.
+		 * @param work - the async battery.
+		 * @returns `{job, done}`; `done` settles when the battery does.
+		 */
+		start(manifest, work) {
+			const job = {
+				id: `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+				phase: "running",
+				startedAt: new Date().toISOString(),
+				finishedAt: null,
+				error: null,
+				report: null
+			};
+			current = job;
+			// The report is built up as the battery goes, not only at the end:
+			// the panel polls GET, so a run that is re-opened halfway through
+			// shows the models that have already finished instead of an empty
+			// frame that looks like a fresh start.
+			job.report = { startedAt: job.startedAt, ...manifest, models: [] };
+			// Deliberately not awaited: the job has to outlive the request that
+			// started it. Every failure path is recorded on the job, so nothing
+			// is left to reject unhandled.
+			const done = (async () => {
+				try {
+					job.report.models = await work(job.report);
+				} catch (error) {
+					job.error = error instanceof Error ? error.message : String(error);
+				} finally {
+					job.phase = job.error === null ? "done" : "error";
+					job.finishedAt = new Date().toISOString();
+					job.report.finishedAt = job.finishedAt;
+				}
+			})();
+			return { job, done };
+		},
+		/** The most recent job, or `null` when nothing has run. */
+		current: () => current
+	};
+}
+
+/**
  * Register the probe route and log the battery on load.
  *
  * @param ctx - the plugin context.
@@ -860,6 +924,8 @@ async function runBattery(ctx, targets, config) {
  */
 function apply(ctx, config = {}) {
 	const cfg = { ...DEFAULTS, ...config };
+	/** One run at a time: a second POST supersedes the first. */
+	const runs = createRunRegistry();
 	/**
 	 * Apply the host's own request gate (origin fence + browser login).
 	 *
@@ -918,22 +984,33 @@ function apply(ctx, config = {}) {
 				probes: PROBES.map((p) => ({ id: p.id, label: p.label, tier: p.tier, kind: p.kind, about: p.about })),
 				targets: targets.map((t) => `${t.provider}/${t.model}`)
 			};
-			// GET is the inspection endpoint: it reports what WOULD run and
-			// returns immediately. Running the battery here would make a plain
-			// curl hang for many minutes and look like a broken route.
+			// GET is the inspection endpoint: it reports the current job's state,
+			// or what WOULD run when nothing has run yet, and always returns
+			// immediately. Running the battery here would make a plain curl hang
+			// for many minutes and look like a broken route.
 			if (req.method === "GET") {
-				sendJson(res, 200, manifest);
+				const job = runs.current();
+				if (job === null) {
+					sendJson(res, 200, { phase: "idle", ...manifest });
+					return;
+				}
+				sendJson(res, 200, {
+					phase: job.phase,
+					id: job.id,
+					startedAt: job.startedAt,
+					finishedAt: job.finishedAt,
+					error: job.error,
+					...(job.report ?? manifest)
+				});
 				return;
 			}
-			const report = { startedAt: new Date().toISOString(), ...manifest, models: [] };
-			try {
-				report.models = await runBattery(ctx, targets, cfg);
-			} catch (error) {
-				sendJson(res, 500, { error: error instanceof Error ? error.message : String(error), ...report });
-				return;
-			}
-			report.finishedAt = new Date().toISOString();
-			sendJson(res, 200, report);
+			// POST starts the job and returns at once. The panel polls GET, so
+			// navigating away mid-run no longer throws the work away.
+			const { job, done } = runs.start(manifest, (live) => runBattery(ctx, targets, cfg, live));
+			// Keep the promise observed even though the response has already been
+			// sent, so a rejected battery cannot surface as an unhandled rejection.
+			done.catch(() => {});
+			sendJson(res, 202, { phase: job.phase, id: job.id, startedAt: job.startedAt, ...manifest });
 		}
 	}), `coding-probe: ${ROUTE_PREFIX}/run`);
 

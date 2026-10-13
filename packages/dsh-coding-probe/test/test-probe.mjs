@@ -25,14 +25,20 @@ let failed = 0;
 let skipped = 0;
 
 /**
- * Run one named check.
+ * Run one named check, awaiting async bodies.
+ *
+ * The `await` is load-bearing: without it an `async` body's assertions never
+ * run, the check is counted as a pass the moment the promise is created, and a
+ * later rejection escapes the counter entirely — the suite prints a green
+ * summary and then dies on an unhandled rejection. Fifteen checks were
+ * vacuous before this was fixed, including every route-level one.
  *
  * @param label - the check description.
- * @param fn - the assertion body.
+ * @param fn - the assertion body, sync or async.
  */
-function test(label, fn) {
+async function test(label, fn) {
 	try {
-		fn();
+		await fn();
 		passed += 1;
 		console.log(`  ✓ ${label}`);
 	} catch (error) {
@@ -58,72 +64,72 @@ const byId = Object.fromEntries(PROBES.map((p) => [p.id, p]));
 const CFG = { ...DEFAULTS, execTimeoutMs: 20000, renderTimeoutMs: 90000 };
 
 console.log("code extraction");
-test("strips a markdown fence", () => {
+await test("strips a markdown fence", () => {
 	assert.equal(extractCode("```js\nconsole.log(1)\n```"), "console.log(1)");
 });
-test("strips a fence with no language tag", () => {
+await test("strips a fence with no language tag", () => {
 	assert.equal(extractCode("```\nlet x = 1;\n```"), "let x = 1;");
 });
-test("recovers HTML from a prose preamble", () => {
+await test("recovers HTML from a prose preamble", () => {
 	assert.ok(extractCode("Sure! Here is the file:\n<!doctype html><html></html>").startsWith("<!doctype html>"));
 });
-test("passes bare code through unchanged", () => {
+await test("passes bare code through unchanged", () => {
 	assert.equal(extractCode("const a = 1;"), "const a = 1;");
 });
-test("an empty reply extracts to an empty string", () => {
+await test("an empty reply extracts to an empty string", () => {
 	assert.equal(extractCode(""), "");
 });
 
 console.log("stdout parsing");
-test("takes the last JSON object, not the first", () => {
+await test("takes the last JSON object, not the first", () => {
 	assert.deepEqual(lastJson('noise\n{"a":1}\n{"b":2}'), { b: 2 });
 });
-test("returns undefined when there is no JSON", () => {
+await test("returns undefined when there is no JSON", () => {
 	assert.equal(lastJson("just text"), undefined);
 });
-test("tolerates a trailing newline", () => {
+await test("tolerates a trailing newline", () => {
 	assert.deepEqual(lastJson('{"optimum":15125}\n'), { optimum: 15125 });
 });
 
 console.log("scoring");
-test("all probes passing is healthy", () => {
+await test("all probes passing is healthy", () => {
 	const rows = [{ tier: "control", ok: true }, { tier: "target", ok: true, attempts: 3, renderedCount: 3, generatedCount: 3 }];
 	assert.equal(score(rows).verdict, "healthy");
 });
-test("a control failure is a general capability regression", () => {
+await test("a control failure is a general capability regression", () => {
 	const rows = [{ tier: "control", ok: false }, { tier: "target", ok: true, attempts: 3, renderedCount: 3, generatedCount: 3 }];
 	assert.equal(score(rows).verdict, "degraded");
 });
-test("control passing but the complex target never rendering is broken-code", () => {
+await test("control passing but the complex target never rendering is broken-code", () => {
 	// The signature actually observed: simple probes pass, the complex
 	// generation completes, and the scene does not render.
 	const rows = [{ tier: "control", ok: true }, { tier: "target", ok: false, attempts: 3, renderedCount: 0, generatedCount: 2 }];
 	assert.equal(score(rows).verdict, "broken-code");
 });
-test("control passing and every complex attempt timing out is timeout-bound", () => {
+await test("control passing and every complex attempt timing out is timeout-bound", () => {
 	// Same surface result as broken-code, different cause and different fix.
 	const rows = [{ tier: "control", ok: true }, { tier: "target", ok: false, attempts: 3, renderedCount: 0, generatedCount: 0 }];
 	assert.equal(score(rows).verdict, "timeout-bound");
 });
-test("some complex attempts rendering is unstable, not healthy", () => {
+await test("some complex attempts rendering is unstable, not healthy", () => {
 	const rows = [{ tier: "control", ok: true }, { tier: "target", ok: false, attempts: 3, renderedCount: 1, generatedCount: 3 }];
 	assert.equal(score(rows).verdict, "unstable");
 });
-test("every probe erroring is unreachable, not degraded", () => {
+await test("every probe erroring is unreachable, not degraded", () => {
 	const rows = [{ tier: "control", ok: false, error: "boom" }, { tier: "target", ok: false, error: "boom" }];
 	assert.equal(score(rows).verdict, "unreachable");
 });
-test("tier counts are reported separately", () => {
+await test("tier counts are reported separately", () => {
 	const s = score([{ tier: "control", ok: true }, { tier: "target", ok: false, attempts: 3, renderedCount: 2, generatedCount: 3 }]);
 	assert.deepEqual(s.control, { total: 1, passed: 1 });
 	assert.deepEqual(s.target, { total: 3, passed: 2, generated: 3 });
 });
-test("an empty result set does not divide by zero", () => {
+await test("an empty result set does not divide by zero", () => {
 	assert.equal(score([]).passed, 0);
 });
 
 console.log("battery integrity");
-test("every probe declares a tier, kind, prompt, and check", () => {
+await test("every probe declares a tier, kind, prompt, and check", () => {
 	for (const probe of PROBES) {
 		assert.ok(["control", "target"].includes(probe.tier), `${probe.id} has a bad tier`);
 		assert.ok(["node", "render", "complex"].includes(probe.kind), `${probe.id} has a bad kind`);
@@ -131,28 +137,28 @@ test("every probe declares a tier, kind, prompt, and check", () => {
 		assert.equal(typeof probe.check, "function", `${probe.id} has no check`);
 	}
 });
-test("probe ids are unique", () => {
+await test("probe ids are unique", () => {
 	const ids = PROBES.map((p) => p.id);
 	assert.equal(new Set(ids).size, ids.length);
 });
-test("the battery covers both tiers", () => {
+await test("the battery covers both tiers", () => {
 	for (const tier of ["control", "target"]) assert.ok(PROBES.some((p) => p.tier === tier), `no probe in tier ${tier}`);
 });
-test("the battery exercises both node and browser execution", () => {
+await test("the battery exercises both node and browser execution", () => {
 	assert.ok(PROBES.some((p) => p.kind === "node"), "no node probe");
 	assert.ok(PROBES.some((p) => p.kind !== "node"), "no browser probe");
 });
-test("defaults stay gentle on throttling gateways", () => {
+await test("defaults stay gentle on throttling gateways", () => {
 	assert.ok(DEFAULTS.concurrency <= 2, "concurrency should stay low");
 	assert.ok(DEFAULTS.spacingMs > 0, "probes should be paced");
 });
-test("the instrumentation forces preserveDrawingBuffer", () => {
+await test("the instrumentation forces preserveDrawingBuffer", () => {
 	// Regression: a WebGL drawing buffer is cleared after compositing, so a
 	// later readback returns an empty canvas and a good scene scores zero.
 	const out = instrument("<canvas></canvas>", "green");
 	assert.ok(out.includes("preserveDrawingBuffer"), "preserveDrawingBuffer must be forced on");
 });
-test("the instrumentation reports non-black ratio and colour spread", () => {
+await test("the instrumentation reports non-black ratio and colour spread", () => {
 	// Regression: grading on "no exception was thrown" passed a 40 KB scene that
 	// threw nothing and painted nothing. Rendering must be measured directly.
 	const out = instrument("<canvas></canvas>", true, 3000);
@@ -160,13 +166,13 @@ test("the instrumentation reports non-black ratio and colour spread", () => {
 	assert.ok(out.includes("distinctColors"), "distinctColors must be measured");
 	assert.ok(out.includes("canvasW"), "canvas size must be reported");
 });
-test("the instrumentation waits before sampling", () => {
+await test("the instrumentation waits before sampling", () => {
 	// Regression: sampling at 800 ms reported a black canvas for a scene that
 	// rendered fully by 2500 ms.
 	const out = instrument("<canvas></canvas>", true, 3000);
 	assert.ok(out.includes("}, 3000);"), "the sample delay must be applied");
 });
-test("the instrumentation declares payload outside the try block", () => {
+await test("the instrumentation declares payload outside the try block", () => {
 	// Regression: `let payload` inside the try is out of scope at the title
 	// assignment, which throws ReferenceError and reports no result at all.
 	const out = instrument("<canvas></canvas>", "green");
@@ -175,22 +181,22 @@ test("the instrumentation declares payload outside the try block", () => {
 });
 
 console.log("calibration: the judge must reject broken programs");
-test("a correct event-loop ordering passes", () => {
+await test("a correct event-loop ordering passes", () => {
 	const code = `const log=[];log.push('A');setTimeout(()=>log.push('D'),0);
 Promise.resolve().then(()=>log.push('C'));log.push('B');
 setTimeout(()=>console.log(JSON.stringify({order:log.join('')})),10);`;
 	assert.equal(execute(byId.scheduler, code, CFG).ok, true);
 });
-test("treating a microtask as a macrotask fails", () => {
+await test("treating a microtask as a macrotask fails", () => {
 	const code = `const log=[];log.push('A');setTimeout(()=>log.push('D'),0);
 setTimeout(()=>log.push('C'),0);log.push('B');
 setTimeout(()=>console.log(JSON.stringify({order:log.join('')})),10);`;
 	assert.equal(execute(byId.scheduler, code, CFG).ok, false);
 });
-test("a program that throws fails", () => {
+await test("a program that throws fails", () => {
 	assert.equal(execute(byId.scheduler, "throw new Error('nope');", CFG).ok, false);
 });
-test("an empty reply fails rather than passing vacuously", () => {
+await test("an empty reply fails rather than passing vacuously", () => {
 	assert.equal(execute(byId.scheduler, "", CFG).ok, false);
 });
 
@@ -219,23 +225,23 @@ const gl=document.getElementById('c').getContext('webgl');
 gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);
 </script></body></html>`;
 
-	test("a correct hand-written WebGL triangle renders green", () => {
+	await test("a correct hand-written WebGL triangle renders green", () => {
 		const r = execute(byId.simple_gl, GOOD_GL, CFG);
 		assert.equal(r.ok, true, `expected pass, got ${r.detail}`);
 	});
-	test("WebGL2 calls on a WebGL1 context are caught", () => {
+	await test("WebGL2 calls on a WebGL1 context are caught", () => {
 		const r = execute(byId.simple_gl, BAD_GL, CFG);
 		assert.equal(r.ok, false, "the degraded program must not pass");
 		assert.match(r.detail, /createVertexArray/);
 	});
-	test("a blank canvas with no exception is still a failure", () => {
+	await test("a blank canvas with no exception is still a failure", () => {
 		// The critical case: silent success. Grading on "no exception" alone
 		// would report this as healthy.
 		const r = execute(byId.complex_scene, SILENT_BLANK, CFG);
 		assert.equal(r.ok, false, "a silent blank render must not pass");
 		assert.match(r.detail, /未渲染|非黑/);
 	});
-	test("a scene that renders with colour spread passes the render check", () => {
+	await test("a scene that renders with colour spread passes the render check", () => {
 		// A multi-colour scene, closer to the real brief than a flat fill.
 		const code = `<!doctype html><html><body><canvas id="c" width="200" height="200"></canvas><script>
 const gl=document.getElementById('c').getContext('webgl');
@@ -254,7 +260,7 @@ gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);gl.drawArrays(gl.TRIANGLES,
 		assert.equal(r.ok, true, `expected pass, got ${r.detail}`);
 		assert.ok(r.evidence.distinctColors >= 8, `expected colour spread, got ${r.evidence.distinctColors}`);
 	});
-	test("an un-resized default canvas is reported as evidence", () => {
+	await test("an un-resized default canvas is reported as evidence", () => {
 		// The captured failure never resized its canvas from the 300x150
 		// default, which is itself proof that its setup code never ran.
 		// The canvas must therefore be declared WITHOUT width/height here.
@@ -278,9 +284,11 @@ console.log("route wiring");
  * Drive `apply` against a fake context and return the captured routes.
  *
  * @param overrides - context members to override.
+ * @param config - plugin config; defaults to a pattern that matches nothing so
+ *   a test that cares about targets must say so explicitly.
  * @returns `{routes, byPath}` where `byPath` is keyed by registered path.
  */
-function mountRoutes(overrides = {}) {
+function mountRoutes(overrides = {}, config = { provider: "a1", modelPattern: "none" }) {
 	const routes = [];
 	const ctx = {
 		effect: (fn) => fn(),
@@ -294,15 +302,35 @@ function mountRoutes(overrides = {}) {
 		},
 		...overrides
 	};
-	apply(ctx, { provider: "a1", modelPattern: "none" });
+	apply(ctx, config);
 	const byPath = {};
 	for (const r of routes) byPath[r.path] = r;
 	return { routes, byPath };
 }
 
+/**
+ * A minimal request that satisfies the body reader.
+ *
+ * The route reads POST bodies with `for await`, so a bare `{method}` object
+ * throws "req is not async iterable" — a failure that only became visible once
+ * the suite started awaiting its async checks.
+ *
+ * @param method - the HTTP method.
+ * @param body - optional JSON body.
+ * @returns the fake request.
+ */
+function fakeRequest(method, body) {
+	const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body))];
+	return {
+		method,
+		async *[Symbol.asyncIterator]() { yield* chunks; },
+		resume() {}
+	};
+}
+
 /** Back-compat helper: just the run route. */
-function mountRoute(overrides = {}) {
-	return mountRoutes(overrides).byPath["/coding-probe/run"];
+function mountRoute(overrides = {}, config) {
+	return mountRoutes(overrides, config).byPath["/coding-probe/run"];
 }
 
 /** A minimal response recorder. */
@@ -320,21 +348,21 @@ function fakeRes() {
 	};
 }
 
-test("the run route is registered at the documented path", () => {
+await test("the run route is registered at the documented path", () => {
 	const route = mountRoute();
 	assert.equal(route.kind, "exact");
 	assert.equal(route.path, "/coding-probe/run");
 });
-test("the model catalog route is registered separately from the run route", () => {
+await test("the model catalog route is registered separately from the run route", () => {
 	const { byPath } = mountRoutes();
 	assert.equal(byPath["/coding-probe/models"].kind, "exact");
 });
-test("the plugin declares the services it reads", () => {
+await test("the plugin declares the services it reads", () => {
 	// Regression: reading an undeclared service throws at apply time, failing
 	// the whole entry rather than the one request.
 	assert.deepEqual(inject, ["webServer", "llm"]);
 });
-test("the host gate is called bound to the connection service", async () => {
+await test("the host gate is called bound to the connection service", async () => {
 	// Regression: requestRejection reads this.trustedHosts/this.browserAuth.
 	// Calling it detached throws, and the webserver turns that into an opaque
 	// 400 for every request.
@@ -346,30 +374,31 @@ test("the host gate is called bound to the connection service", async () => {
 		}
 	};
 	const route = mountRoute({ get: () => connection });
-	await route.handler({ method: "POST" }, fakeRes());
+	await route.handler(fakeRequest("POST"), fakeRes());
 	assert.equal(sawThis, connection);
 });
-test("a gate rejection is honoured with its own status", async () => {
+await test("a gate rejection is honoured with its own status", async () => {
 	const route = mountRoute({ get: () => ({ requestRejection: () => 401 }) });
 	const res = fakeRes();
-	await route.handler({ method: "POST" }, res);
+	await route.handler(fakeRequest("POST"), res);
 	assert.equal(res.statusCode, 401);
 });
-test("an unsupported method is refused", async () => {
+await test("an unsupported method is refused", async () => {
 	const route = mountRoute();
 	const res = fakeRes();
-	await route.handler({ method: "DELETE" }, res);
+	await route.handler(fakeRequest("DELETE"), res);
 	assert.equal(res.statusCode, 405);
 });
-test("a GET returns the manifest without running the battery", async () => {
+await test("a GET returns the manifest without running the battery", async () => {
 	// Regression: GET used to fall through to runBattery, so inspecting the
 	// route with curl hung for minutes and looked like a broken route.
 	let streamed = false;
-	const route = mountRoute({
-		llm: { listModels: async () => [{ id: "probe-model" }], stream: () => { streamed = true; throw new Error("must not stream"); } }
-	});
+	const route = mountRoute(
+		{ llm: { listModels: async () => [{ id: "probe-model" }], stream: () => { streamed = true; throw new Error("must not stream"); } } },
+		{ provider: "a1", modelPattern: "" }
+	);
 	const res = fakeRes();
-	await route.handler({ method: "GET" }, res);
+	await route.handler(fakeRequest("GET"), res);
 	const payload = JSON.parse(res.body);
 	assert.equal(res.statusCode, 200);
 	assert.equal(payload.probes.length, PROBES.length);
@@ -378,9 +407,100 @@ test("a GET returns the manifest without running the battery", async () => {
 	assert.equal(streamed, false, "GET must not call the model route");
 });
 
+console.log("background run");
+
+await test("a POST acknowledges the start without waiting for the battery", async () => {
+	// The regression this guards: POST used to run the whole battery inline and
+	// only reply when it finished, so the run belonged to an HTTP request whose
+	// reader is gone the moment the panel unmounts. A conversation switch then
+	// discarded minutes of work and the panel came back looking idle.
+	let released;
+	const held = new Promise((resolve) => { released = resolve; });
+	const route = mountRoute(
+		{
+			llm: {
+				listProviders: () => [{ id: "a1" }],
+				listModels: async () => [{ id: "m" }],
+				// Never settles until the test releases it: if the handler awaited
+				// the battery, this await would hang and the test would time out.
+				stream: async function* () { await held; yield { type: "finish", reason: "stop" }; }
+			}
+		},
+		{ provider: "a1", modelPattern: "" }
+	);
+	const res = fakeRes();
+	await route.handler(fakeRequest("POST", { models: ["a1/m"] }), res);
+	const payload = JSON.parse(res.body);
+	assert.equal(res.statusCode, 202, "a started job is accepted, not completed");
+	assert.equal(payload.phase, "running");
+	assert.ok(typeof payload.id === "string" && payload.id.length > 0, "the job must be identifiable");
+	released();
+});
+
+await test("GET reports the running job so a remounted panel can rejoin it", async () => {
+	// This is the whole fix for "switching conversations asks me to start over":
+	// the job lives on the host, so a panel that mounts mid-run reads it back.
+	let released;
+	const held = new Promise((resolve) => { released = resolve; });
+	const route = mountRoute(
+		{
+			llm: {
+				listProviders: () => [{ id: "a1" }],
+				listModels: async () => [{ id: "m" }],
+				stream: async function* () { await held; yield { type: "finish", reason: "stop" }; }
+			}
+		},
+		{ provider: "a1", modelPattern: "", spacingMs: 0, complexTrials: 1 }
+	);
+	await route.handler(fakeRequest("POST", { models: ["a1/m"] }), fakeRes());
+
+	const res = fakeRes();
+	await route.handler(fakeRequest("GET"), res);
+	const payload = JSON.parse(res.body);
+	assert.equal(payload.phase, "running", "GET must report the in-flight job, not idle");
+	assert.deepEqual(payload.targets, ["a1/m"], "the manifest must describe the running job");
+	released();
+});
+
+await test("a GET with no run reports idle rather than inventing a report", async () => {
+	const route = mountRoute();
+	const res = fakeRes();
+	await route.handler(fakeRequest("GET"), res);
+	const payload = JSON.parse(res.body);
+	assert.equal(res.statusCode, 200);
+	assert.equal(payload.phase, "idle");
+	assert.equal(payload.models, undefined, "idle must not fabricate results");
+});
+
+await test("a second POST supersedes the first job", async () => {
+	let released;
+	const held = new Promise((resolve) => { released = resolve; });
+	const route = mountRoute(
+		{
+			llm: {
+				listProviders: () => [{ id: "a1" }],
+				listModels: async () => [{ id: "m" }],
+				stream: async function* () { await held; yield { type: "finish", reason: "stop" }; }
+			}
+		},
+		{ provider: "a1", modelPattern: "" }
+	);
+	const first = fakeRes();
+	await route.handler(fakeRequest("POST", { models: ["a1/first"] }), first);
+	const firstId = JSON.parse(first.body).id;
+	const second = fakeRes();
+	await route.handler(fakeRequest("POST", { models: ["a1/second"] }), second);
+	const secondId = JSON.parse(second.body).id;
+	assert.notEqual(firstId, secondId, "each run gets its own id");
+	const res = fakeRes();
+	await route.handler(fakeRequest("GET"), res);
+	assert.deepEqual(JSON.parse(res.body).targets, ["a1/second"], "GET follows the newest job");
+	released();
+});
+
 console.log("model selection");
 
-test("an explicit request selection wins over the configured pattern", async () => {
+await test("an explicit request selection wins over the configured pattern", async () => {
 	// This is the whole point of the picker: the panel's ticked boxes must be
 	// what runs, not a pattern baked into the profile patch.
 	const targets = await resolveTargets(
@@ -393,7 +513,7 @@ test("an explicit request selection wins over the configured pattern", async () 
 		{ provider: "a1", model: "chosen-two" }
 	]);
 });
-test("an explicit configured list beats the pattern when no request selection exists", async () => {
+await test("an explicit configured list beats the pattern when no request selection exists", async () => {
 	const targets = await resolveTargets(
 		{ llm: { listModels: async () => [{ id: "pattern-match" }] } },
 		{ provider: "a1", modelPattern: "pattern-match", models: ["a1/pinned"] },
@@ -401,7 +521,7 @@ test("an explicit configured list beats the pattern when no request selection ex
 	);
 	assert.deepEqual(targets, [{ provider: "a1", model: "pinned" }]);
 });
-test("the pattern is still the fallback for headless use", async () => {
+await test("the pattern is still the fallback for headless use", async () => {
 	const targets = await resolveTargets(
 		{ llm: { listModels: async () => [{ id: "gpt-6-sol" }, { id: "other" }] } },
 		{ provider: "a1", modelPattern: "gpt-6", models: [] },
@@ -409,7 +529,7 @@ test("the pattern is still the fallback for headless use", async () => {
 	);
 	assert.deepEqual(targets, [{ provider: "a1", model: "gpt-6-sol" }]);
 });
-test("an empty request selection falls back rather than probing nothing", async () => {
+await test("an empty request selection falls back rather than probing nothing", async () => {
 	const targets = await resolveTargets(
 		{ llm: { listModels: async () => [{ id: "fallback" }] } },
 		{ provider: "a1", modelPattern: "fall", models: [] },
@@ -417,16 +537,16 @@ test("an empty request selection falls back rather than probing nothing", async 
 	);
 	assert.deepEqual(targets, [{ provider: "a1", model: "fallback" }]);
 });
-test("a bare model id uses the configured provider", () => {
+await test("a bare model id uses the configured provider", () => {
 	assert.deepEqual(parseSelection(["solo"], "a1"), [{ provider: "a1", model: "solo" }]);
 	assert.deepEqual(parseSelection(["p/m"], "a1"), [{ provider: "p", model: "m" }]);
 });
-test("a POST body selects models", async () => {
+await test("a POST body selects models", async () => {
 	const chunks = [Buffer.from('{"models":["a1/x","a1/y"]}')];
 	const req = { async *[Symbol.asyncIterator]() { for (const c of chunks) yield c; } };
 	assert.deepEqual(await readSelection(req), ["a1/x", "a1/y"]);
 });
-test("an empty or malformed POST body falls back to the configured targets", async () => {
+await test("an empty or malformed POST body falls back to the configured targets", async () => {
 	const empty = { async *[Symbol.asyncIterator]() {} };
 	assert.equal(await readSelection(empty), undefined);
 	const bad = { async *[Symbol.asyncIterator]() { yield Buffer.from("not json"); } };
@@ -434,7 +554,7 @@ test("an empty or malformed POST body falls back to the configured targets", asy
 	const wrong = { async *[Symbol.asyncIterator]() { yield Buffer.from('{"models":[]}'); } };
 	assert.equal(await readSelection(wrong), undefined);
 });
-test("a POST body selection reaches the run route", async () => {
+await test("a POST body selection reaches the run route", async () => {
 	const route = mountRoute({
 		llm: { listModels: async () => [{ id: "ignored-by-pattern" }], stream: () => { throw new Error("must not stream"); } }
 	});
@@ -449,7 +569,7 @@ test("a POST body selection reaches the run route", async () => {
 	const payload = JSON.parse(res.body);
 	assert.deepEqual(payload.targets, ["a1/picked"]);
 });
-test("the catalog lists every provider's models", async () => {
+await test("the catalog lists every provider's models", async () => {
 	const catalog = await listCandidates({
 		llm: {
 			listProviders: () => [{ id: "a1" }, { id: "b2" }],
@@ -460,7 +580,7 @@ test("the catalog lists every provider's models", async () => {
 	assert.deepEqual(catalog.models.map((m) => `${m.provider}/${m.model}`), ["a1/m1", "a1/m2", "b2/m3"]);
 	assert.deepEqual(catalog.failed, []);
 });
-test("one failing provider does not hide the others", async () => {
+await test("one failing provider does not hide the others", async () => {
 	// A single unreachable route must not blank the whole picker.
 	const catalog = await listCandidates({
 		llm: {
@@ -475,25 +595,32 @@ test("one failing provider does not hide the others", async () => {
 	assert.equal(catalog.failed.length, 1);
 	assert.equal(catalog.failed[0].provider, "bad");
 });
-test("the catalog route returns the picker payload", async () => {
-	const { byPath } = mountRoutes({
-		llm: {
-			listProviders: () => [{ id: "a1" }],
-			listModels: async () => [{ id: "gpt-6-sol" }, { id: "gpt-6-astra" }],
-			stream: () => { throw new Error("unused"); }
-		}
-	});
+await test("the catalog route returns the picker payload", async () => {
+	const { byPath } = mountRoutes(
+		{
+			llm: {
+				listProviders: () => [{ id: "a1" }],
+				listModels: async () => [{ id: "gpt-6-sol" }, { id: "gpt-6-astra" }],
+				stream: () => { throw new Error("unused"); }
+			}
+		},
+		// The catalog lists every model; `defaults` is what the pattern selects.
+		// With the pattern matching nothing the defaults are empty by design.
+		{ provider: "a1", modelPattern: "gpt-6" }
+	);
 	const res = fakeRes();
-	await byPath["/coding-probe/models"].handler({ method: "GET" }, res);
+	await byPath["/coding-probe/models"].handler(fakeRequest("GET"), res);
 	const payload = JSON.parse(res.body);
 	assert.equal(res.statusCode, 200);
 	assert.deepEqual(payload.models.map((m) => `${m.provider}/${m.model}`), ["a1/gpt-6-astra", "a1/gpt-6-sol"]);
-	assert.deepEqual(payload.defaults, ["a1/gpt-6-astra", "a1/gpt-6-sol"]);
+	// `defaults` keeps the provider's own listing order; only the picker's
+	// `models` list is sorted. Asserting the sorted order here would be wrong.
+	assert.deepEqual(payload.defaults, ["a1/gpt-6-sol", "a1/gpt-6-astra"]);
 });
-test("the catalog route refuses non-GET", async () => {
+await test("the catalog route refuses non-GET", async () => {
 	const { byPath } = mountRoutes();
 	const res = fakeRes();
-	await byPath["/coding-probe/models"].handler({ method: "POST" }, res);
+	await byPath["/coding-probe/models"].handler(fakeRequest("POST"), res);
 	assert.equal(res.statusCode, 405);
 });
 

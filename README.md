@@ -218,9 +218,27 @@ Each package is self-contained with no external dependencies:
 ```sh
 cd packages/dsh-llm-loop-guard     && npm test   # 33 assertions
 cd packages/dsh-goal-autoresume    && npm test   # 11 assertions
-cd packages/dsh-coding-probe      && npm test   # 40 assertions
+cd packages/dsh-coding-probe      && npm test   # 57 assertions
+cd packages/dsh-fingerprint-probe  && npm test   # 64 assertions
 cd packages/dsh-thinking-effort    && npm test   # 46 assertions
 ```
+
+Both probe panels run their battery **on the host, not on the request that started
+it**. The main slot renders one panel at a time and the workspace clears the active
+panel when the session changes, so a run tied to its HTTP request was thrown away
+the moment you switched conversations — the panel came back as though it had never
+run. `POST` now starts the job and returns `202` immediately; the panel polls
+`GET`, which reports `phase` plus whatever models have already finished, and
+re-joins an in-flight run on mount. The ticked models live in a module-scoped
+store for the same reason.
+
+`dsh-coding-probe`'s suite is worth reading for one detail: its `test()` helper
+used to be synchronous while 15 of its checks were `async`. A synchronous call to
+an async function returns a promise immediately, so those assertions never ran and
+were counted as passes — and the trailing `process.exit()` meant any later
+rejection could not surface either. The suite was green and vacuous at the same
+time. Fixing the `await` immediately exposed 3 real failures. A green suite and an
+effective one are not the same thing.
 
 `dsh-thinking-effort`'s suite runs in two layers: pure-function checks for the
 level block, the adaptive-id matcher and the route/model filtering rules, then a
