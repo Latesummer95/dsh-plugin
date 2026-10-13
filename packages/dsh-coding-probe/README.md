@@ -47,16 +47,31 @@
 | `degraded` | 连对照组都失败，能力整体下降 |
 | `unreachable` | 全部请求失败，无法评估 |
 
+## 选模型
+
+打开面板会先拉取该网关下**所有 provider 的所有模型**，列成可勾选的清单（按 provider 分组），
+你勾哪几个就只测哪几个。默认勾选的是 profile 里配置的那批，所以不勾也能直接跑。
+
+不再需要为了换模型去改 `cordis.patch.yml` 里的 `modelPattern`——那只是没勾选时的兜底。
+
+优先级（高 → 低）：
+
+1. **面板勾选的模型**（POST body 里的 `models`）——正常路径，永远以你的勾选为准
+2. `config.models`——写在 profile 里的固定清单
+3. `config.provider` + `config.modelPattern`——子串匹配，给脚本/无头调用兜底
+
+单个 provider 读取失败不会让整个列表空白，面板会把失败原因列出来，其余模型照常可选。
+
 ## 配置
 
-写进 profile 的 `cordis.patch.yml`：
+写进 profile 的 `cordis.patch.yml`（现在基本只需要保留执行相关的参数）：
 
 ```yaml
 - id: coding-probe
   name: dsh-coding-probe
   config:
     provider: a1
-    modelPattern: gpt-6      # 子串匹配，选中要检测的模型
+    modelPattern: gpt-6      # 只是面板未勾选时的兜底，正常用面板选
     reasoningEffort: high    # 设为 null 则完全不传该字段
     complexTrials: 3         # 复杂任务重复次数
     sampleDelayMs: 3000      # 渲染采样延迟
@@ -64,7 +79,7 @@
     concurrency: 1           # 网关限流严重，建议保持 1
 ```
 
-指定具体模型（优先于 `modelPattern`）：
+也可以直接钉死要测的模型（优先级高于 `modelPattern`）：
 
 ```yaml
     models:
@@ -74,10 +89,12 @@
 
 ## HTTP 接口
 
+- `GET /coding-probe/models` — 返回可选模型清单（provider / models / defaults），面板用它渲染勾选框
 - `GET /coding-probe/run` — 返回探针清单，不跑模型，便于人工检查
-- `POST /coding-probe/run` — 跑完整电池，返回每个模型的判定与逐次试验的原始证据
+- `POST /coding-probe/run` — 跑完整电池；body 可带 `{"models":["a1/gpt-6-astra", ...]}` 指定要测的模型，
+  不带则用 profile 里配置的那批
 
-两个方法都经过宿主自身的来源校验（`connection.requestRejection`）。
+三个方法都经过宿主自身的来源校验（`connection.requestRejection`）。
 
 ## 测试
 
@@ -85,9 +102,8 @@
 node test/test-probe.mjs
 ```
 
-40 项断言，含**标定测试**：把已知正确和已知错误的程序喂给真实判分逻辑，确认它既能让正确的通过，
+53 项断言，含**标定测试**：把已知正确和已知错误的程序喂给真实判分逻辑，确认它既能让正确的通过，
 也能让错误的失败。没有这组测试，一个「什么都判通过」的判分器看起来和健康结果一模一样。
-
 标定用例包括：
 
 - 正确的 DP / 事件循环程序 → 通过

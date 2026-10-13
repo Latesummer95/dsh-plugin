@@ -30,6 +30,7 @@ window.__ModuleLoader__.load({
 
 		const PANEL_ID = "coding-probe";
 		const ROUTE = "coding-probe/run";
+		const MODELS_ROUTE = "coding-probe/models";
 
 		/**
 		 * Verdict presentation: colour, Chinese label, and what it means.
@@ -81,7 +82,14 @@ window.__ModuleLoader__.load({
 			pass: { color: "#3fb950" },
 			fail: { color: "#f85149" },
 			muted: { opacity: 0.6 },
-			empty: { opacity: 0.6, padding: "28px 0", textAlign: "center", fontSize: "12px" }
+			empty: { opacity: 0.6, padding: "28px 0", textAlign: "center", fontSize: "12px" },
+			picker: { border: "1px solid rgba(127,127,127,.24)", borderRadius: "10px", padding: "12px 14px", display: "flex", flexDirection: "column", gap: "9px" },
+			pickerHead: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", flexWrap: "wrap" },
+			pickerTitle: { fontSize: "12px", fontWeight: 600, opacity: 0.85 },
+			grid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))", gap: "6px 14px" },
+			modelItem: { display: "flex", alignItems: "center", gap: "7px", fontSize: "12px", cursor: "pointer", minWidth: 0 },
+			modelName: { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+			linkBtn: { background: "none", border: "none", padding: 0, color: "inherit", opacity: 0.7, cursor: "pointer", fontSize: "12px", textDecoration: "underline" }
 		};
 
 		/**
@@ -161,27 +169,132 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * The model picker.
+		 *
+		 * Selection is the user's, not a hard-coded pattern: the panel asks the
+		 * Node half for the full provider/model catalog and sends back exactly
+		 * what is ticked. Grouping by provider keeps a long list readable.
+		 *
+		 * @param props - catalog, current selection, and change handlers.
+		 * @returns the picker element.
+		 */
+		function ModelPicker({ catalog, selected, onToggle, onSelectAll, onSelectNone, loading, error, onReload }) {
+			const models = catalog?.models ?? [];
+			const byProvider = new Map();
+			for (const entry of models) {
+				if (!byProvider.has(entry.provider)) byProvider.set(entry.provider, []);
+				byProvider.get(entry.provider).push(entry);
+			}
+			const key = (entry) => `${entry.provider}/${entry.model}`;
+			const allSelected = models.length > 0 && models.every((m) => selected.has(key(m)));
+
+			return React.createElement("section", { style: styles.picker },
+				React.createElement("div", { style: styles.pickerHead },
+					React.createElement("span", { style: styles.pickerTitle },
+						loading ? "正在读取模型列表…" : `选择要检测的模型（已选 ${selected.size} / ${models.length}）`
+					),
+					React.createElement("span", { style: { display: "flex", gap: "12px", alignItems: "center" } },
+						React.createElement("button", {
+							type: "button", style: styles.linkBtn,
+							onClick: () => (allSelected ? onSelectNone() : onSelectAll()),
+							disabled: loading || models.length === 0
+						}, allSelected ? "全不选" : "全选"),
+						React.createElement("button", {
+							type: "button", style: styles.linkBtn, onClick: onReload, disabled: loading
+						}, "刷新")
+					)
+				),
+				error !== null && React.createElement("div", { style: styles.err }, `读取模型列表失败：${error}`),
+				!loading && error === null && models.length === 0 &&
+					React.createElement("div", { style: styles.muted }, "没有可用的模型。"),
+				(catalog?.failed ?? []).length > 0 && React.createElement("div", { style: styles.detail },
+					`部分 provider 读取失败：${catalog.failed.map((f) => `${f.provider}（${f.error}）`).join("；")}`
+				),
+				Array.from(byProvider.entries()).map(([provider, entries]) =>
+					React.createElement("div", { key: provider, style: { display: "flex", flexDirection: "column", gap: "5px" } },
+						React.createElement("div", { style: { ...styles.muted, fontSize: "11px" } }, provider),
+						React.createElement("div", { style: styles.grid },
+							entries.map((entry) => {
+								const id = key(entry);
+								const checked = selected.has(id);
+								return React.createElement("label", { key: id, style: styles.modelItem, title: id },
+									React.createElement("input", {
+										type: "checkbox",
+										checked,
+										onChange: () => onToggle(id)
+									}),
+									React.createElement("span", { style: styles.modelName }, entry.model)
+								);
+							})
+						)
+					)
+				)
+			);
+		}
+
+		/**
 		 * The probe panel.
 		 *
 		 * @returns the panel element.
 		 */
 		function ProbePanel() {
 			const [state, setState] = React.useState({ phase: "idle", report: null, error: null });
+			const [catalog, setCatalog] = React.useState(null);
+			const [catalogError, setCatalogError] = React.useState(null);
+			const [loadingModels, setLoadingModels] = React.useState(true);
+			const [selected, setSelected] = React.useState(() => new Set());
+
+			const loadModels = React.useCallback(async () => {
+				setLoadingModels(true);
+				setCatalogError(null);
+				try {
+					const response = await fetch(api(MODELS_ROUTE));
+					const payload = await response.json();
+					if (!response.ok) throw new Error(payload?.error ?? `HTTP ${response.status}`);
+					setCatalog(payload);
+					// Preselect the profile's configured targets so the default
+					// behaviour is unchanged until the user deliberately edits it.
+					setSelected(new Set(payload.defaults ?? []));
+				} catch (error) {
+					setCatalogError(error instanceof Error ? error.message : String(error));
+				} finally {
+					setLoadingModels(false);
+				}
+			}, []);
+
+			React.useEffect(() => { loadModels(); }, [loadModels]);
+
+			const toggle = React.useCallback((id) => {
+				setSelected((prev) => {
+					const next = new Set(prev);
+					if (next.has(id)) next.delete(id); else next.add(id);
+					return next;
+				});
+			}, []);
+			const selectAll = React.useCallback(() => {
+				setSelected(new Set((catalog?.models ?? []).map((m) => `${m.provider}/${m.model}`)));
+			}, [catalog]);
+			const selectNone = React.useCallback(() => setSelected(new Set()), []);
 
 			const run = React.useCallback(async () => {
 				setState({ phase: "running", report: null, error: null });
 				try {
-					const response = await fetch(api(ROUTE), { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+					const response = await fetch(api(ROUTE), {
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify({ models: Array.from(selected) })
+					});
 					const payload = await response.json();
 					if (!response.ok) throw new Error(payload?.error ?? `HTTP ${response.status}`);
 					setState({ phase: "done", report: payload, error: null });
 				} catch (error) {
 					setState({ phase: "error", report: null, error: error instanceof Error ? error.message : String(error) });
 				}
-			}, []);
+			}, [selected]);
 
 			const running = state.phase === "running";
 			const report = state.report;
+			const canRun = !running && !loadingModels && selected.size > 0;
 
 			return React.createElement("div", { style: styles.root },
 				React.createElement("header", null,
@@ -195,17 +308,23 @@ window.__ModuleLoader__.load({
 						"对照组能过、复杂任务跑不起来，就是复杂代码生成退化。"
 					)
 				),
+				React.createElement(ModelPicker, {
+					catalog, selected, loading: loadingModels, error: catalogError,
+					onToggle: toggle, onSelectAll: selectAll, onSelectNone: selectNone, onReload: loadModels
+				}),
 				React.createElement("div", { style: styles.bar },
-					React.createElement(primitives.Button, { variant: "primary", size: "sm", onClick: run, disabled: running },
+					React.createElement(primitives.Button, { variant: "primary", size: "sm", onClick: run, disabled: !canRun },
 						running ? "检测中…" : "开始检测"
 					),
+					selected.size === 0 && !loadingModels &&
+						React.createElement("span", { style: styles.muted }, "请至少选择一个模型"),
 					report !== null && React.createElement("span", { style: styles.muted },
 						`共 ${report.models?.length ?? 0} 个模型 · 复杂任务 ${report.complexTrials ?? 1} 次/模型 · 推理档位 ${report.reasoningEffort ?? "默认"}`
 					)
 				),
 				state.error !== null && React.createElement("div", { style: styles.err }, `检测失败：${state.error}`),
 				running && React.createElement("div", { style: styles.empty }, "正在逐个生成并执行代码。复杂任务每次生成可能需要 1–2 分钟，请耐心等待…"),
-				!running && report === null && state.error === null && React.createElement("div", { style: styles.empty }, "点击「开始检测」运行探针。"),
+				!running && report === null && state.error === null && React.createElement("div", { style: styles.empty }, "选好模型后点击「开始检测」运行探针。"),
 				report !== null && report.models?.length === 0 && React.createElement("div", { style: styles.empty }, "没有匹配到模型。请检查插件的 provider / modelPattern 配置。"),
 				(report?.models ?? []).map((model) => React.createElement(ModelCard, { key: `${model.provider}/${model.model}`, model }))
 			);
@@ -233,7 +352,7 @@ window.__ModuleLoader__.load({
 			}, ProbeIcon));
 		}
 
-		Object.assign(module.exports, { PANEL_ID, ProbePanel, apply, inject });
+		Object.assign(module.exports, { ModelPicker, PANEL_ID, ProbePanel, apply, inject });
 		return module.exports;
 	}
 });

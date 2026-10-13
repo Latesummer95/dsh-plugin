@@ -523,18 +523,121 @@ async function drainStream(stream) {
  * @param config - the resolved plugin config.
  * @returns a promise of `{provider, model}` pairs.
  */
-async function resolveTargets(ctx, config) {
+/**
+ * Turn `provider/model` (or a bare model id) strings into targets.
+ *
+ * @param entries - the requested selection.
+ * @param fallbackProvider - provider used for entries with no `/`.
+ * @returns the parsed targets.
+ */
+function parseSelection(entries, fallbackProvider) {
+	return entries.map((entry) => {
+		const at = String(entry).indexOf("/");
+		if (at < 0) return { provider: fallbackProvider, model: String(entry) };
+		return { provider: String(entry).slice(0, at), model: String(entry).slice(at + 1) };
+	});
+}
+
+/**
+ * Resolve which models to probe.
+ *
+ * Precedence, highest first:
+ *  1. `requested` — the models the user ticked in the panel (or posted to the
+ *     route). This is the normal path: the panel always sends an explicit list,
+ *     so the probe never silently grades a different set than the user chose.
+ *  2. `config.models` — an explicit list pinned in the profile patch.
+ *  3. `config.provider` + `config.modelPattern` — the legacy substring filter,
+ *     kept as the fallback for scripted/headless use.
+ *
+ * @param ctx - the plugin context.
+ * @param config - the resolved plugin config.
+ * @param requested - optional explicit selection from the request.
+ * @returns the `{provider, model}` pairs to probe.
+ */
+async function resolveTargets(ctx, config, requested) {
+	if (Array.isArray(requested) && requested.length > 0) {
+		return parseSelection(requested, config.provider);
+	}
 	if (Array.isArray(config.models) && config.models.length > 0) {
-		return config.models.map((entry) => {
-			const at = String(entry).indexOf("/");
-			if (at < 0) return { provider: config.provider, model: String(entry) };
-			return { provider: String(entry).slice(0, at), model: String(entry).slice(at + 1) };
-		});
+		return parseSelection(config.models, config.provider);
 	}
 	const models = await ctx.llm.listModels(config.provider);
 	const pattern = String(config.modelPattern ?? "");
 	const filtered = pattern.length === 0 ? models : models.filter((m) => String(m.id).includes(pattern));
 	return filtered.map((m) => ({ provider: config.provider, model: m.id }));
+}
+
+/**
+ * List every provider/model the panel can offer, so the user picks instead of
+ * relying on a hard-coded pattern.
+ *
+ * A provider whose catalog fails is reported with its error and skipped rather
+ * than failing the whole listing: one unreachable route must not hide the
+ * models that are reachable.
+ *
+ * @param ctx - the plugin context.
+ * @returns `{providers, models}` where `models` is a flat `provider/model` list.
+ */
+async function listCandidates(ctx) {
+	const providers = (ctx.llm.listProviders?.() ?? [])
+		.map((p) => String(p?.id ?? p?.provider ?? p?.name ?? ""))
+		.filter((id) => id.length > 0);
+	const models = [];
+	const failed = [];
+	for (const provider of providers) {
+		try {
+			for (const model of await ctx.llm.listModels(provider)) {
+				models.push({ provider, model: String(model.id), name: model.name ?? null });
+			}
+		} catch (error) {
+			failed.push({ provider, error: error instanceof Error ? error.message : String(error) });
+		}
+	}
+	models.sort((a, b) => (a.provider === b.provider
+		? a.model.localeCompare(b.model)
+		: a.provider.localeCompare(b.provider)));
+	return { providers, models, failed };
+}
+
+/**
+ * Collect a bounded request body as UTF-8 text.
+ *
+ * @param req - the incoming request.
+ * @returns the body text, or `""` when absent/oversized.
+ */
+async function readBody(req) {
+	const chunks = [];
+	let size = 0;
+	for await (const chunk of req) {
+		size += chunk.byteLength;
+		if (size > 1024 * 1024) {
+			req.resume();
+			return "";
+		}
+		chunks.push(chunk);
+	}
+	return Buffer.concat(chunks, size).toString("utf8");
+}
+
+/**
+ * Read the requested model selection from a POST body.
+ *
+ * @param req - the incoming request.
+ * @returns the selection, or `undefined` to fall back to the configured targets.
+ */
+async function readSelection(req) {
+	const text = await readBody(req);
+	if (text.trim().length === 0) return undefined;
+	let body;
+	try {
+		body = JSON.parse(text);
+	} catch {
+		return undefined;
+	}
+	const raw = body?.models ?? body?.targets;
+	if (!Array.isArray(raw)) return undefined;
+	const cleaned = raw.map((m) => String(m).trim()).filter((m) => m.length > 0);
+	return cleaned.length > 0 ? cleaned : undefined;
 }
 
 /**
@@ -797,9 +900,11 @@ function apply(ctx, config = {}) {
 				res.end();
 				return;
 			}
+			// POST may carry an explicit model selection; GET never does.
+			const requested = req.method === "POST" ? await readSelection(req) : undefined;
 			let targets;
 			try {
-				targets = await resolveTargets(ctx, cfg);
+				targets = await resolveTargets(ctx, cfg, requested);
 			} catch (error) {
 				sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
 				return;
@@ -832,6 +937,39 @@ function apply(ctx, config = {}) {
 		}
 	}), `coding-probe: ${ROUTE_PREFIX}/run`);
 
+	// Model catalog for the panel's picker. Kept off the run route so opening
+	// the panel never triggers a battery.
+	ctx.effect(() => ctx.webServer.register({
+		kind: "exact",
+		path: `${ROUTE_PREFIX}/models`,
+		handler: async (req, res) => {
+			const rejection = rejectRequest(req);
+			if (rejection !== undefined) {
+				res.statusCode = rejection;
+				res.end();
+				return;
+			}
+			if (req.method !== "GET") {
+				res.statusCode = 405;
+				res.setHeader("allow", "GET");
+				res.end();
+				return;
+			}
+			try {
+				const catalog = await listCandidates(ctx);
+				sendJson(res, 200, {
+					provider: cfg.provider,
+					modelPattern: cfg.modelPattern,
+					// What the profile would probe with no explicit selection.
+					defaults: (await resolveTargets(ctx, cfg)).map((t) => `${t.provider}/${t.model}`),
+					...catalog
+				});
+			} catch (error) {
+				sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+			}
+		}
+	}), `coding-probe: ${ROUTE_PREFIX}/models`);
+
 	ctx.logger?.info(
 		"coding-probe: %d probes ready (%d control, %d target, %d complex trials), provider=%s pattern=%s",
 		PROBES.length,
@@ -855,8 +993,12 @@ export {
 	inject,
 	instrument,
 	lastJson,
+	listCandidates,
 	measureRender,
 	name,
+	parseSelection,
+	readSelection,
+	resolveTargets,
 	runNode,
 	score
 };

@@ -18,7 +18,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { COMPLEX_BRIEF, DEFAULTS, PROBES, apply, execute, extractCode, inject, instrument, lastJson, measureRender, score } from "../index.js";
+import { COMPLEX_BRIEF, DEFAULTS, PROBES, apply, execute, extractCode, inject, instrument, lastJson, listCandidates, measureRender, parseSelection, readSelection, resolveTargets, score } from "../index.js";
 
 let passed = 0;
 let failed = 0;
@@ -275,23 +275,34 @@ gl.createVertexArray();
 console.log("route wiring");
 
 /**
- * Drive `apply` against a fake context and return the captured route.
+ * Drive `apply` against a fake context and return the captured routes.
  *
  * @param overrides - context members to override.
- * @returns the captured route.
+ * @returns `{routes, byPath}` where `byPath` is keyed by registered path.
  */
-function mountRoute(overrides = {}) {
-	let route;
+function mountRoutes(overrides = {}) {
+	const routes = [];
 	const ctx = {
 		effect: (fn) => fn(),
 		get: () => undefined,
 		logger: { info: () => {}, warn: () => {} },
-		webServer: { register: (r) => { route = r; return () => {}; } },
-		llm: { listModels: async () => [], stream: () => { throw new Error("unused"); } },
+		webServer: { register: (r) => { routes.push(r); return () => {}; } },
+		llm: {
+			listProviders: () => [{ id: "a1", name: "A1" }],
+			listModels: async () => [],
+			stream: () => { throw new Error("unused"); }
+		},
 		...overrides
 	};
 	apply(ctx, { provider: "a1", modelPattern: "none" });
-	return route;
+	const byPath = {};
+	for (const r of routes) byPath[r.path] = r;
+	return { routes, byPath };
+}
+
+/** Back-compat helper: just the run route. */
+function mountRoute(overrides = {}) {
+	return mountRoutes(overrides).byPath["/coding-probe/run"];
 }
 
 /** A minimal response recorder. */
@@ -309,10 +320,14 @@ function fakeRes() {
 	};
 }
 
-test("the route is registered at the documented path", () => {
+test("the run route is registered at the documented path", () => {
 	const route = mountRoute();
 	assert.equal(route.kind, "exact");
 	assert.equal(route.path, "/coding-probe/run");
+});
+test("the model catalog route is registered separately from the run route", () => {
+	const { byPath } = mountRoutes();
+	assert.equal(byPath["/coding-probe/models"].kind, "exact");
 });
 test("the plugin declares the services it reads", () => {
 	// Regression: reading an undeclared service throws at apply time, failing
@@ -361,6 +376,125 @@ test("a GET returns the manifest without running the battery", async () => {
 	assert.equal(payload.models, undefined, "GET must not run models");
 	assert.deepEqual(payload.targets, ["a1/probe-model"]);
 	assert.equal(streamed, false, "GET must not call the model route");
+});
+
+console.log("model selection");
+
+test("an explicit request selection wins over the configured pattern", async () => {
+	// This is the whole point of the picker: the panel's ticked boxes must be
+	// what runs, not a pattern baked into the profile patch.
+	const targets = await resolveTargets(
+		{ llm: { listModels: async () => [{ id: "pattern-match" }] } },
+		{ provider: "a1", modelPattern: "pattern-match" },
+		["a1/chosen-one", "a1/chosen-two"]
+	);
+	assert.deepEqual(targets, [
+		{ provider: "a1", model: "chosen-one" },
+		{ provider: "a1", model: "chosen-two" }
+	]);
+});
+test("an explicit configured list beats the pattern when no request selection exists", async () => {
+	const targets = await resolveTargets(
+		{ llm: { listModels: async () => [{ id: "pattern-match" }] } },
+		{ provider: "a1", modelPattern: "pattern-match", models: ["a1/pinned"] },
+		undefined
+	);
+	assert.deepEqual(targets, [{ provider: "a1", model: "pinned" }]);
+});
+test("the pattern is still the fallback for headless use", async () => {
+	const targets = await resolveTargets(
+		{ llm: { listModels: async () => [{ id: "gpt-6-sol" }, { id: "other" }] } },
+		{ provider: "a1", modelPattern: "gpt-6", models: [] },
+		undefined
+	);
+	assert.deepEqual(targets, [{ provider: "a1", model: "gpt-6-sol" }]);
+});
+test("an empty request selection falls back rather than probing nothing", async () => {
+	const targets = await resolveTargets(
+		{ llm: { listModels: async () => [{ id: "fallback" }] } },
+		{ provider: "a1", modelPattern: "fall", models: [] },
+		[]
+	);
+	assert.deepEqual(targets, [{ provider: "a1", model: "fallback" }]);
+});
+test("a bare model id uses the configured provider", () => {
+	assert.deepEqual(parseSelection(["solo"], "a1"), [{ provider: "a1", model: "solo" }]);
+	assert.deepEqual(parseSelection(["p/m"], "a1"), [{ provider: "p", model: "m" }]);
+});
+test("a POST body selects models", async () => {
+	const chunks = [Buffer.from('{"models":["a1/x","a1/y"]}')];
+	const req = { async *[Symbol.asyncIterator]() { for (const c of chunks) yield c; } };
+	assert.deepEqual(await readSelection(req), ["a1/x", "a1/y"]);
+});
+test("an empty or malformed POST body falls back to the configured targets", async () => {
+	const empty = { async *[Symbol.asyncIterator]() {} };
+	assert.equal(await readSelection(empty), undefined);
+	const bad = { async *[Symbol.asyncIterator]() { yield Buffer.from("not json"); } };
+	assert.equal(await readSelection(bad), undefined);
+	const wrong = { async *[Symbol.asyncIterator]() { yield Buffer.from('{"models":[]}'); } };
+	assert.equal(await readSelection(wrong), undefined);
+});
+test("a POST body selection reaches the run route", async () => {
+	const route = mountRoute({
+		llm: { listModels: async () => [{ id: "ignored-by-pattern" }], stream: () => { throw new Error("must not stream"); } }
+	});
+	const req = {
+		method: "POST",
+		async *[Symbol.asyncIterator]() { yield Buffer.from('{"models":["a1/picked"]}'); }
+	};
+	const res = fakeRes();
+	// The battery will run and fail (no stream), but the manifest must show the
+	// picked target — that is what proves the selection was honoured.
+	await route.handler(req, res);
+	const payload = JSON.parse(res.body);
+	assert.deepEqual(payload.targets, ["a1/picked"]);
+});
+test("the catalog lists every provider's models", async () => {
+	const catalog = await listCandidates({
+		llm: {
+			listProviders: () => [{ id: "a1" }, { id: "b2" }],
+			listModels: async (p) => (p === "a1" ? [{ id: "m1" }, { id: "m2" }] : [{ id: "m3" }])
+		}
+	});
+	assert.deepEqual(catalog.providers, ["a1", "b2"]);
+	assert.deepEqual(catalog.models.map((m) => `${m.provider}/${m.model}`), ["a1/m1", "a1/m2", "b2/m3"]);
+	assert.deepEqual(catalog.failed, []);
+});
+test("one failing provider does not hide the others", async () => {
+	// A single unreachable route must not blank the whole picker.
+	const catalog = await listCandidates({
+		llm: {
+			listProviders: () => [{ id: "bad" }, { id: "good" }],
+			listModels: async (p) => {
+				if (p === "bad") throw new Error("route down");
+				return [{ id: "ok" }];
+			}
+		}
+	});
+	assert.deepEqual(catalog.models.map((m) => `${m.provider}/${m.model}`), ["good/ok"]);
+	assert.equal(catalog.failed.length, 1);
+	assert.equal(catalog.failed[0].provider, "bad");
+});
+test("the catalog route returns the picker payload", async () => {
+	const { byPath } = mountRoutes({
+		llm: {
+			listProviders: () => [{ id: "a1" }],
+			listModels: async () => [{ id: "gpt-6-sol" }, { id: "gpt-6-astra" }],
+			stream: () => { throw new Error("unused"); }
+		}
+	});
+	const res = fakeRes();
+	await byPath["/coding-probe/models"].handler({ method: "GET" }, res);
+	const payload = JSON.parse(res.body);
+	assert.equal(res.statusCode, 200);
+	assert.deepEqual(payload.models.map((m) => `${m.provider}/${m.model}`), ["a1/gpt-6-astra", "a1/gpt-6-sol"]);
+	assert.deepEqual(payload.defaults, ["a1/gpt-6-astra", "a1/gpt-6-sol"]);
+});
+test("the catalog route refuses non-GET", async () => {
+	const { byPath } = mountRoutes();
+	const res = fakeRes();
+	await byPath["/coding-probe/models"].handler({ method: "POST" }, res);
+	assert.equal(res.statusCode, 405);
 });
 
 const total = passed + failed + skipped;
