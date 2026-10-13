@@ -396,7 +396,15 @@ window.__ModuleLoader__.load({
 						running ? "检测中…" : "开始检测"
 					),
 					selected.size === 0 && !loadingModels &&
-						React.createElement("span", { style: styles.muted }, "请至少选择一个模型"),
+						React.createElement("span", { style: styles.muted },
+							(models?.length ?? 0) > 0
+								? "请至少选择一个模型"
+								: "没有可用的模型"
+						),
+					selected.size === 0 && !loadingModels && (models?.length ?? 0) > 0 && (catalog?.modelPattern ?? null) !== null &&
+						React.createElement("span", { style: styles.muted },
+							`（配置的 modelPattern「${catalog.modelPattern}」没有匹配到模型，请手动勾选）`
+						),
 					reference
 						? React.createElement("span", { style: styles.muted },
 								`参考库 ${reference.models.length} 个模型` +

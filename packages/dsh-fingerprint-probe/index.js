@@ -295,9 +295,16 @@ async function elicit(ctx, target, challenge, config) {
 			ms: Date.now() - started,
 			outputTokens: usage?.outputTokens ?? null,
 			finish: reason?.kind ?? null,
-			text: accepted ? text : "",
-			// Kept for rejected answers so the panel can show the raw reply
-			// instead of only asserting that it was unusable.
+			/**
+			 * The full raw reply, kept even when rejected.
+			 *
+			 * The scorer re-derives acceptance from the text itself, and it needs
+			 * the real reply to report an accurate `parsed_numbers`. Blanking it
+			 * here would make every rejection look like an empty answer and would
+			 * collapse the "0/3 valid" denominator to "0/0". It is stripped from
+			 * the payload sent to the browser.
+			 */
+			text,
 			preview: accepted ? "" : String(text).slice(0, 400),
 			error: failed
 				? String(reason?.failure?.message ?? reason?.kind)
@@ -370,9 +377,13 @@ async function probeModel(ctx, target, reference, config, onProgress) {
 		if (slot < REQUIRED_OUTPUTS - 1 && config.spacingMs > 0) await new Promise((r) => setTimeout(r, config.spacingMs));
 	}
 
+	// All three attempts are handed to the scorer, not just the accepted ones:
+	// it applies the acceptance rule itself and reports `used_outputs` against
+	// the real attempt count. Pre-filtering here made a round where every
+	// challenge failed report "0/0 valid answers" instead of "0/3".
 	const accepted = attempts.filter((a) => a.accepted);
 	const analysis = analyzeOutputs(
-		accepted.map((a) => ({ text: a.text, expected_count: a.expected })),
+		attempts.map((a) => ({ text: a.text, expected_count: a.expected })),
 		reference.bank,
 		reference.detector,
 		{ allowPartial: true }
