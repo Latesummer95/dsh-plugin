@@ -218,7 +218,7 @@ Each package is self-contained with no external dependencies:
 ```sh
 cd packages/dsh-llm-loop-guard     && npm test   # 33 assertions
 cd packages/dsh-goal-autoresume    && npm test   # 11 assertions
-cd packages/dsh-coding-probe      && npm test   # 57 assertions
+cd packages/dsh-coding-probe      && npm test   # 63 assertions
 cd packages/dsh-fingerprint-probe  && npm test   # 64 assertions
 cd packages/dsh-thinking-effort    && npm test   # 46 assertions
 ```

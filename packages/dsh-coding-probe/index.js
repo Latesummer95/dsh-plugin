@@ -702,6 +702,13 @@ async function generate(ctx, target, prompt, config) {
 async function runSingle(ctx, target, probe, config) {
 	const generated = await generate(ctx, target, probe.prompt, config);
 	if (!generated.ok) {
+		const message = generated.error ?? "空回复";
+		// `refused` marks a request the gateway rejected before the model saw it.
+		// The control tier needs this as much as the target tier does: both of its
+		// probes are single-shot, so two 429s would otherwise read as "基础能力
+		// 退化" — a capability claim built entirely on the gateway's own refusals.
+		const cause = classifyFailure(message);
+		const refused = cause === "rate-limit" || cause === "transport" ? 1 : 0;
 		return {
 			id: probe.id,
 			label: probe.label,
@@ -709,8 +716,9 @@ async function runSingle(ctx, target, probe, config) {
 			kind: probe.kind,
 			about: probe.about,
 			ok: false,
-			detail: "生成失败",
-			error: generated.error ?? "空回复",
+			refusedCount: refused,
+			detail: refused > 0 ? "请求被网关拒绝，未到达模型" : "生成失败",
+			error: message,
 			ms: generated.ms
 		};
 	}
@@ -733,6 +741,25 @@ async function runSingle(ctx, target, probe, config) {
 }
 
 /**
+ * Classify why a generation did not produce usable text.
+ *
+ * The distinction is load-bearing for accuracy. A request the gateway *refused*
+ * (429 rate limit, 5xx, a dropped socket) is not evidence about the model's
+ * coding ability at all — counting it as a failure makes a throttled run look
+ * like a degraded model, which is the one mistake this battery must not make.
+ *
+ * @param error - the failure text from {@link generate}.
+ * @returns `rate-limit` | `timeout` | `transport` | `generation`.
+ */
+function classifyFailure(error) {
+	const text = String(error ?? "").toLowerCase();
+	if (text.includes("429") || text.includes("rate limit") || text.includes("rate_limit")) return "rate-limit";
+	if (text.includes("timeout") || text.includes("timed out") || text.includes("abort")) return "timeout";
+	if (text.includes("502") || text.includes("503") || text.includes("504") || text.includes("econnreset") || text.includes("socket")) return "transport";
+	return "generation";
+}
+
+/**
  * Run one repeated probe (target tier) and report a rate, not a single result.
  *
  * A single trial cannot distinguish an intermittently failing route from a
@@ -752,7 +779,8 @@ async function runRepeated(ctx, target, probe, config) {
 	for (let i = 1; i <= attempts; i += 1) {
 		const generated = await generate(ctx, target, probe.prompt, config);
 		if (!generated.ok) {
-			trials.push({ attempt: i, generated: false, error: generated.error ?? "空回复", ms: generated.ms });
+			const message = generated.error ?? "空回复";
+			trials.push({ attempt: i, generated: false, error: message, cause: classifyFailure(message), ms: generated.ms });
 		} else {
 			const graded = execute(probe, generated.text, config);
 			trials.push({
@@ -770,6 +798,9 @@ async function runRepeated(ctx, target, probe, config) {
 	const generatedCount = trials.filter((t) => t.generated).length;
 	const renderedCount = trials.filter((t) => t.generated && t.ok).length;
 	const timedOut = trials.length - generatedCount;
+	// Trials the gateway refused never reached the model, so they are counted
+	// separately and excluded from the capability verdict.
+	const refusedCount = trials.filter((t) => t.cause === "rate-limit" || t.cause === "transport").length;
 	return {
 		id: probe.id,
 		label: probe.label,
@@ -781,7 +812,8 @@ async function runRepeated(ctx, target, probe, config) {
 		generatedCount,
 		renderedCount,
 		timedOut,
-		detail: `${attempts} 次尝试：生成成功 ${generatedCount} 次，其中渲染成功 ${renderedCount} 次，超时/失败 ${timedOut} 次`,
+		refusedCount,
+		detail: `${attempts} 次尝试：生成成功 ${generatedCount} 次，其中渲染成功 ${renderedCount} 次，超时/失败 ${timedOut} 次${refusedCount > 0 ? `（其中 ${refusedCount} 次被网关拒绝，未到达模型）` : ""}`,
 		trials
 	};
 }
@@ -792,6 +824,12 @@ async function runRepeated(ctx, target, probe, config) {
  * The verdict separates the failure shapes that need different responses, and
  * uses the control tier to tell a total outage apart from a complexity-specific
  * collapse. That distinction is the reason the battery is split at all.
+ *
+ * Trials the gateway refused (429/5xx) are excluded from the capability
+ * judgement and reported as `inconclusive` when too little usable evidence is
+ * left. Counting a rate limit as a failed generation would make a throttled run
+ * indistinguishable from a degraded model, and that is precisely the wrong
+ * conclusion for this tool to reach.
  *
  * @param results - the probe records for one route.
  * @returns the score, tier breakdown, and verdict.
@@ -805,19 +843,37 @@ function score(results) {
 	const targetRendered = target.reduce((sum, row) => sum + (row.renderedCount ?? (row.ok ? 1 : 0)), 0);
 	const targetAttempts = target.reduce((sum, row) => sum + (row.attempts ?? 1), 0);
 	const targetGenerated = target.reduce((sum, row) => sum + (row.generatedCount ?? (row.error === undefined ? 1 : 0)), 0);
+	const targetRefused = target.reduce((sum, row) => sum + (row.refusedCount ?? 0), 0);
+	const controlRefused = control.filter((row) => (row.refusedCount ?? 0) > 0).length;
+	// Attempts that actually reached the model and produced code.
+	const usableAttempts = Math.max(0, targetAttempts - targetRefused);
+	// Control probes the gateway refused tell us nothing about basic ability, so
+	// they are excluded from that judgement rather than counted as failures.
+	const controlUsable = control.length - controlRefused;
+	const controlPassed = countOk(control);
 
 	let verdict;
 	if (allErrored) verdict = "unreachable";
-	else if (control.length > 0 && countOk(control) < control.length) verdict = "degraded";
-	else if (targetAttempts > 0 && targetRendered === 0) verdict = targetGenerated > 0 ? "broken-code" : "timeout-bound";
-	else if (targetAttempts > 0 && targetRendered < targetAttempts) verdict = "unstable";
+	// A control probe that really ran and failed is capability evidence, and it
+	// outranks everything below.
+	else if (controlUsable > 0 && controlPassed < controlUsable) verdict = "degraded";
+	// No usable evidence at either tier: every request was refused upstream, so
+	// no capability claim can be made in either direction.
+	else if (controlUsable === 0 && usableAttempts === 0) verdict = "inconclusive";
+	// The controls passed but every complex attempt was refused, so the question
+	// the battery exists to answer was never actually put to the model.
+	else if (targetAttempts > 0 && usableAttempts === 0) verdict = "inconclusive";
+	else if (usableAttempts > 0 && targetRendered === 0) verdict = targetGenerated > 0 ? "broken-code" : "timeout-bound";
+	else if (usableAttempts > 0 && targetRendered < usableAttempts) verdict = "unstable";
+	// The controls were all refused, so the target result stands on its own.
+	else if (controlUsable === 0) verdict = targetRendered > 0 ? "healthy" : "inconclusive";
 	else verdict = "healthy";
 
 	return {
 		total: results.length,
 		passed: countOk(results),
-		control: { total: control.length, passed: countOk(control) },
-		target: { total: targetAttempts, passed: targetRendered, generated: targetGenerated },
+		control: { total: control.length, passed: controlPassed, refused: controlRefused, usable: controlUsable },
+		target: { total: targetAttempts, passed: targetRendered, generated: targetGenerated, refused: targetRefused, usable: usableAttempts },
 		verdict
 	};
 }
@@ -1064,6 +1120,7 @@ export {
 	PROBES,
 	ROUTE_PREFIX,
 	apply,
+	classifyFailure,
 	execute,
 	extractCode,
 	generate,

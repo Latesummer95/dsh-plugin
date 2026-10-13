@@ -41,9 +41,10 @@ window.__ModuleLoader__.load({
 		const VERDICTS = {
 			healthy: { tone: "#3fb950", label: "正常", note: "对照组与复杂任务全部通过，复杂代码生成能力完整。" },
 			unstable: { tone: "#db8b0b", label: "不稳定", note: "复杂任务只有部分次数成功。同一提示词重复跑结果不一致，说明生成质量在边界上波动。" },
-			"broken-code": { tone: "#f85149", label: "复杂代码生成退化", note: "简单任务能过，复杂任务也能生成完，但产出的代码跑不起来或渲染不出内容。这正是降智的特征。" },
+			"broken-code": { tone: "#f85149", label: "复杂代码生成退化", note: "简单任务能过，但复杂任务生成出来的代码跑不起来或渲染不出内容。这正是降智的特征。" },
 			"timeout-bound": { tone: "#f85149", label: "复杂任务全部失败", note: "简单任务能过，但复杂任务每次都生成失败（网关超时/中断），从未产出可用结果。" },
 			degraded: { tone: "#db8b0b", label: "基础能力退化", note: "连对照组（基础 WebGL、事件循环）都失败，能力整体下降。" },
+			inconclusive: { tone: "#8b949e", label: "无法判定", note: "复杂任务的请求都被网关拒绝（限流/5xx），根本没到达模型。这不是能力证据——等网关恢复后重测。" },
 			unreachable: { tone: "#8b949e", label: "不可达", note: "全部请求失败，无法评估。" }
 		};
 
@@ -188,7 +189,12 @@ window.__ModuleLoader__.load({
 				React.createElement("span", null, `对照组 ${s.control?.passed ?? 0}/${s.control?.total ?? 0}`),
 				React.createElement("span", null, `复杂任务 ${s.target?.passed ?? 0}/${s.target?.total ?? 0}`),
 				(s.target?.generated ?? 0) < (s.target?.total ?? 0) &&
-					React.createElement("span", { style: styles.muted }, `其中生成成功 ${s.target?.generated ?? 0} 次`)
+					React.createElement("span", { style: styles.muted }, `其中生成成功 ${s.target?.generated ?? 0} 次`),
+				// Refused attempts never reached the model. Showing them separately
+				// stops a rate-limited run from reading as a failed one.
+				((s.target?.refused ?? 0) > 0 || (s.control?.refused ?? 0) > 0) &&
+					React.createElement("span", { style: { ...styles.muted, color: "#db8b0b" } },
+						`${(s.control?.refused ?? 0) + (s.target?.refused ?? 0)} 次被网关拒绝（未到达模型）`)
 			);
 			return React.createElement("section", { style: styles.card },
 				React.createElement("div", { style: styles.cardHead },

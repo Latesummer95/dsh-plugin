@@ -18,7 +18,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { COMPLEX_BRIEF, DEFAULTS, PROBES, apply, execute, extractCode, inject, instrument, lastJson, listCandidates, measureRender, parseSelection, readSelection, resolveTargets, score } from "../index.js";
+import { COMPLEX_BRIEF, DEFAULTS, PROBES, apply, classifyFailure, execute, extractCode, inject, instrument, lastJson, listCandidates, measureRender, parseSelection, readSelection, resolveTargets, score } from "../index.js";
 
 let passed = 0;
 let failed = 0;
@@ -121,11 +121,83 @@ await test("every probe erroring is unreachable, not degraded", () => {
 });
 await test("tier counts are reported separately", () => {
 	const s = score([{ tier: "control", ok: true }, { tier: "target", ok: false, attempts: 3, renderedCount: 2, generatedCount: 3 }]);
-	assert.deepEqual(s.control, { total: 1, passed: 1 });
-	assert.deepEqual(s.target, { total: 3, passed: 2, generated: 3 });
+	assert.deepEqual(s.control, { total: 1, passed: 1, refused: 0, usable: 1 });
+	assert.deepEqual(s.target, { total: 3, passed: 2, generated: 3, refused: 0, usable: 3 });
 });
 await test("an empty result set does not divide by zero", () => {
 	assert.equal(score([]).passed, 0);
+});
+
+console.log("网关拒绝不算能力证据");
+
+await test("a rate limit is classified apart from a generation failure", () => {
+	// The accuracy bug this guards, seen live: two of three complex trials died on
+	// an upstream 429 and the panel still said "复杂任务也能生成完" and reported
+	// 降智. A refused request never reached the model, so it is not evidence.
+	assert.equal(classifyFailure('429 {"message":"Upstream rate limit exceeded"}'), "rate-limit");
+	assert.equal(classifyFailure("rate_limit_error"), "rate-limit");
+	assert.equal(classifyFailure("request timed out after 200000ms"), "timeout");
+	assert.equal(classifyFailure("502 Bad gateway"), "transport");
+	assert.equal(classifyFailure("ECONNRESET"), "transport");
+	assert.equal(classifyFailure("模型返回了空文本"), "generation");
+});
+
+await test("every complex attempt refused is inconclusive, not broken-code", () => {
+	// Same surface shape as broken-code (nothing rendered) but the cause is the
+	// gateway, and calling it degradation is the one wrong answer that matters.
+	// The control tier passed, so the only unusable evidence is the refused
+	// target attempts; that is what makes this inconclusive rather than degraded.
+	const rows = [{ tier: "control", ok: true }, { tier: "target", ok: false, attempts: 3, renderedCount: 0, generatedCount: 0, refusedCount: 3 }];
+	const s = score(rows);
+	assert.equal(s.verdict, "inconclusive");
+	assert.equal(s.target.refused, 3);
+	assert.equal(s.target.usable, 0, "no attempt reached the model");
+});
+
+await test("a partly refused run judges only the attempts that reached the model", () => {
+	// Two of three refused, the one real attempt rendered fine: the honest verdict
+	// is healthy-for-what-was-measured, not unstable (which is what counting the
+	// refusals as failures would produce).
+	const rows = [{ tier: "control", ok: true }, { tier: "target", ok: true, attempts: 3, renderedCount: 1, generatedCount: 1, refusedCount: 2 }];
+	const s = score(rows);
+	assert.equal(s.verdict, "healthy");
+	assert.equal(s.target.usable, 1);
+	assert.equal(s.target.refused, 2);
+});
+
+await test("refused control probes do not read as a basic-capability collapse", () => {
+	// Seen live: a1/deepseek-v4.1-flash got 429 on BOTH control probes and the
+	// panel said 基础能力退化. Both requests were refused before the model ran,
+	// so there is no capability evidence at all — the honest answer is 无法判定.
+	const rows = [
+		{ tier: "control", ok: false, error: "429", refusedCount: 1 },
+		{ tier: "control", ok: false, error: "429", refusedCount: 1 },
+		{ tier: "target", ok: false, attempts: 3, renderedCount: 0, generatedCount: 0, refusedCount: 3 }
+	];
+	const s = score(rows);
+	assert.equal(s.verdict, "inconclusive");
+	assert.equal(s.control.refused, 2);
+	assert.equal(s.control.usable, 0);
+});
+
+await test("a real control failure still wins over a refusal elsewhere", () => {
+	// One control probe genuinely ran and failed; that IS capability evidence and
+	// must not be excused by the other probe having been rate-limited.
+	const rows = [
+		{ tier: "control", ok: false, error: "assertion failed" },
+		{ tier: "control", ok: false, error: "429", refusedCount: 1 },
+		{ tier: "target", ok: true, attempts: 3, renderedCount: 3, generatedCount: 3 }
+	];
+	const s = score(rows);
+	assert.equal(s.verdict, "degraded");
+	assert.equal(s.control.usable, 1, "only the probe that really ran counts");
+});
+
+await test("refusals do not mask a real collapse among the attempts that did run", () => {
+	// One attempt reached the model and produced unrenderable code, two were
+	// refused. That is still broken-code: there IS usable evidence of a failure.
+	const rows = [{ tier: "control", ok: true }, { tier: "target", ok: false, attempts: 3, renderedCount: 0, generatedCount: 1, refusedCount: 2 }];
+	assert.equal(score(rows).verdict, "broken-code");
 });
 
 console.log("battery integrity");
