@@ -1,0 +1,20 @@
+{
+  "name": "dsh-thinking-effort",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "Adds thinking-effort levels (and the adaptive-thinking compat flag) to every anthropic-messages provider route at runtime, without touching the profile YAML",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node test/test-augment.mjs"
+  }
+}

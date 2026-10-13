@@ -1,0 +1,40 @@
+# dsh-thinking-effort bundle patch.
+#
+# Adds ONE host row: the plugin that gives every `anthropic-messages` provider
+# route its thinking-effort levels.
+#
+# A patch replaces the targeted row's whole `config`, so this file contains
+# ONLY an additive `insert` row and never overrides the shipped `llm-pi-ai`
+# row. That matters here: the `llm-pi-ai` config carries your providers,
+# models, baseURLs and API-key refs, and restating it from a patch would
+# clobber whatever you configured yourself.
+#
+# The plugin deliberately does not read or write the profile YAML either — it
+# augments the config in memory at load time, so your own edits stay the
+# single source of truth. `name` is resolved relative to this file.
+#
+# Optional config (all fields default to the values below):
+#
+#   config:
+#     # Levels to offer, as level -> wire spelling. Defaults to the five
+#     # extended levels; `minimal` is omitted because Anthropic's effort enum
+#     # has no such value.
+#     levels: { low: low, medium: medium, high: high, xhigh: xhigh, max: max }
+#     # Declare `off` as well. Off by default, and deliberately so: pi-ai treats
+#     # a *declared* `off: null` as "send thinking.type = disabled", which the
+#     # adaptive-only models reject with HTTP 400, whereas an *omitted* `off`
+#     # means "send no thinking field at all".
+#     includeOff: false
+#     # Replace a `reasoningEfforts` the profile already declares. Off by
+#     # default, so a hand-tuned model keeps its own levels.
+#     overwrite: false
+#     # Add `compat.forceAdaptiveThinking` to models whose id is in
+#     # `adaptiveModels`. Turning this off leaves every `compat` block alone.
+#     adaptiveCompat: true
+#     # Restrict the augmentation to these provider route ids (default: all).
+#     providers: []
+#     excludeProviders: []
+
+- insert:
+    - id: thinking-effort
+      name: './index.js'

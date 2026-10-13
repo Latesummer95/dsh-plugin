@@ -27,6 +27,7 @@ rather than in any one application.
 | [`dsh-goal-autoresume`](packages/dsh-goal-autoresume) | Re-arm an armed goal after a bounded number of loop-guard failures, so an unattended run does not silently stop |
 | [`dsh-coding-probe`](packages/dsh-coding-probe) | Sidebar panel that measures high-complexity code generation by **executing** what the model writes |
 | [`dsh-fingerprint-probe`](packages/dsh-fingerprint-probe) | Sidebar panel that identifies which model a route actually serves, by comparing its number-choice distribution against a reference bank of 58 models |
+| [`dsh-thinking-effort`](packages/dsh-thinking-effort) | Give every `anthropic-messages` route its thinking-effort levels at load time, without editing the profile YAML |
 
 The first two protect a session. The last two answer the question they cannot:
 not "did this request fail" but "is this route still what it claims to be" — the
@@ -65,6 +66,50 @@ ctx.on("agent/error", ({ agent }) => { disarm(stateFor(agent)); });
 That is a sound default, but it means the first step that exhausts its retry
 budget stops an autonomous run, with nobody watching to notice. `dsh-goal-autoresume`
 re-arms the goal for loop-guard failures only, bounded per goal.
+
+## Why the thinking-effort plugin exists
+
+`dsh-llm-pi-ai` reads a model's selectable thinking levels from `reasoningEfforts`.
+A route that declares nothing resolves to `reasoning: base?.reasoning ?? false`, and
+`base` only exists for model ids in pi-ai's **builtin catalog**. A custom route
+pointing at a gateway is not a catalog route, so its models come up with no
+reasoning at all: no effort picker in the GUI, and any `reasoningEffort` in the
+profile is rejected with `UNSUPPORTED_REASONING_EFFORT`.
+
+The obvious fix is per-model YAML, which is exactly what you do not want to repeat
+on every machine — and it cannot be shipped as a bundle patch, because a patch
+replaces the targeted row's whole `config` and `models` is an array that merges by
+replacement rather than by element.
+
+So the plugin augments the config **in memory** instead. `llm-pi-ai`'s config is a
+cosmokit *volatile* ref, and `cordis-plugin-loader` has a dedicated path for
+changing one without restarting the plugin: `Entry._commitVolatile()` re-runs the
+`internal/config` waterfall, sees that only volatile fields moved (two volatile
+refs compare equal regardless of content), writes the values into the live refs and
+emits `loader/volatile-update`, which `llm-pi-ai` answers by rebuilding its provider
+directory. The plugin registers the waterfall listener that does the augmenting and
+then asks the loader to commit it. Because the listener runs on *every* resolution,
+a later ordinary settings edit cannot silently drop the levels.
+
+Two details are load-bearing and easy to get backwards:
+
+- **`off` is omitted, not declared.** In `resolveModelReasoning` an *omitted* level
+  is pinned to `null`, so pi-ai sends no `thinking` field at all — the correct
+  "do not think". Declaring `off: null` leaves the key `undefined`, which makes
+  pi-ai send `{type: "disabled"}`, and the adaptive-only models reject that with
+  HTTP 400.
+- **Adaptive thinking is matched by model id.** pi-ai picks between
+  `{type: "adaptive"}` + `output_config.effort` (when
+  `compat.forceAdaptiveThinking` is set) and `{type: "enabled", budget_tokens}`
+  (otherwise), and neither works everywhere: 6 of the 15 Anthropic models in pi-ai's
+  catalog are budget-based. pi-ai's catalog is not importable from a profile plugin,
+  so the plugin carries the nine adaptive ids explicitly and only ever *adds* the
+  flag. A model that is not on the list keeps whatever `compat` it already had.
+
+Nothing is written to the profile: `entry.options.config` stays pristine, and no
+`ctx.settings` call is made. Configure it from the inserted row if the defaults do
+not suit — `levels`, `includeOff`, `overwrite`, `adaptiveCompat`, `providers`,
+`excludeProviders` (documented in the package's `cordis.patch.yml`).
 
 ## Install
 
@@ -174,7 +219,18 @@ Each package is self-contained with no external dependencies:
 cd packages/dsh-llm-loop-guard     && npm test   # 33 assertions
 cd packages/dsh-goal-autoresume    && npm test   # 11 assertions
 cd packages/dsh-coding-probe      && npm test   # 40 assertions
+cd packages/dsh-thinking-effort    && npm test   # 46 assertions
 ```
+
+`dsh-thinking-effort`'s suite runs in two layers: pure-function checks for the
+level block, the adaptive-id matcher and the route/model filtering rules, then a
+real integration run that boots the actual `cordis-plugin-loader` and the actual
+`dsh-llm-pi-ai` and asserts on `llm.resolveModelInfo(...).reasoning` — the same
+surface the GUI reads to build its effort picker. The integration layer is the one
+that matters, because it exercises the volatile-commit seam end to end; a passing
+run means the levels are really live rather than merely present in some
+intermediate object. It locates the DSH installation automatically (override with
+`DSH_ROOT`) and skips that layer if it cannot be found.
 
 `packages/dsh-llm-loop-guard/test/fixture-degenerate.txt` is a real 15 KB sample
 of the captured degeneration, kept so the detector is tested against the actual
