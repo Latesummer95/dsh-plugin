@@ -23,7 +23,22 @@
  * @module dsh-goal-autoresume
  */
 
+import z from "@deepseek-ai/schemastery";
+
 const name = "goal-autoresume";
+
+/**
+ * The plugin's own settings, surfaced in the Settings page.
+ *
+ * `enabled` is the field the toggle row writes. It is `volatile` so flipping it
+ * does not restart the plugin, which would clear the per-goal auto-resume budget
+ * and hand back a goal the user had deliberately left disarmed. The flag is read
+ * per event instead, so the next failure already honours it.
+ */
+export const Config = z.object({
+	enabled: z.boolean().default(true).volatile(),
+	maxAutoResumes: z.number().step(1).min(0).default(3).volatile()
+});
 
 /** Default markers identifying a loop-guard failure. */
 const DEFAULT_MARKERS = ["llm-loop-guard"];
@@ -51,15 +66,28 @@ function renderError(error) {
  * @param config - optional overrides for {@link DEFAULTS}.
  */
 function apply(ctx, config = {}) {
-	const cfg = {
-		...DEFAULTS,
-		...config
+	// Re-read on every error so the Settings switch takes effect immediately.
+	// A boot-time snapshot would need a plugin restart, which would clear the
+	// per-goal budget and re-arm goals the user had deliberately left disarmed.
+	const readConfig = () => {
+		try {
+			const entry = ctx.loader?.entries?.().find?.(
+				(candidate) => candidate?.fiber?.runtime?.name === name,
+			);
+			return { ...DEFAULTS, ...(entry?.options?.config ?? config) };
+		} catch {
+			return { ...DEFAULTS, ...config };
+		}
 	};
-	const markers = Array.isArray(cfg.markers) && cfg.markers.length > 0 ? cfg.markers : DEFAULT_MARKERS;
-	const maxAutoResumes = Number.isFinite(cfg.maxAutoResumes) && cfg.maxAutoResumes > 0 ? Math.floor(cfg.maxAutoResumes) : DEFAULTS.maxAutoResumes;
+
+	const markers = Array.isArray(config.markers) && config.markers.length > 0 ? config.markers : DEFAULT_MARKERS;
 	/** Per-agent auto-resume budget, keyed by the goal it was issued for. */
 	const budgets = new WeakMap();
 	ctx.on("agent/error", ({ agent, error }) => {
+		const cfg = readConfig();
+		// Absent means on; any explicitly falsy value means off, for the same
+		// reason as the loop guard: the config is not always schema-validated.
+		if (cfg.enabled !== undefined && !cfg.enabled) return;
 		const text = renderError(error);
 		if (!markers.some((marker) => text.includes(marker))) return;
 		const goals = ctx.goals;
@@ -74,6 +102,7 @@ function apply(ctx, config = {}) {
 			};
 			budgets.set(agent, budget);
 		}
+			const maxAutoResumes = Number.isFinite(cfg.maxAutoResumes) && cfg.maxAutoResumes > 0 ? Math.floor(cfg.maxAutoResumes) : DEFAULTS.maxAutoResumes;
 		if (budget.used >= maxAutoResumes) {
 			ctx.logger?.warn("goal-autoresume: goal \"%s\" already used %d auto-resumes; leaving it disarmed", goal.id, budget.used);
 			return;

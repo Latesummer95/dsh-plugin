@@ -1,5 +1,12 @@
 /**
- * dsh-thinking-effort — give every `anthropic-messages` route its thinking levels.
+ * dsh-thinking-effort — give every route its thinking levels.
+ *
+ * Not Anthropic-only: `reasoningEfforts` is a DSH-level field that
+ * `resolveModelReasoning` converts into `reasoning: true` plus a
+ * `thinkingLevelMap`, whatever API the route speaks. A route with no declared
+ * levels therefore has no selector for a reason that has nothing to do with its
+ * protocol, which is why this covers every route and lets the per-API wire
+ * spellings differ.
  *
  * ## The problem
  *
@@ -75,11 +82,32 @@
  * @see @earendil-works/pi-ai/dist/api/anthropic-messages.js — thinking construction
  */
 
+import z from "@deepseek-ai/schemastery";
+
 /** Host plugin name, as referenced by `cordis.patch.yml`. */
 export const name = "thinking-effort";
 
 /** The loader service is the only thing needed, and only to trigger a commit. */
 export const inject = ["loader"];
+
+/**
+ * The plugin's own settings, surfaced in the Settings page.
+ *
+ * `enabled` is the field the toggle row writes. It is `volatile` because toggling
+ * it must not restart the plugin: the augmentation is re-applied through the same
+ * `internal/config` listener and re-committed with `_commitVolatile()`, exactly
+ * like the values the profile supplies. A restart would drop every live route
+ * subscription for a one-bit change.
+ *
+ * Declaring it volatile is what puts the row in the Settings page at all —
+ * `dsh-settings` only projects schema nodes marked volatile.
+ */
+export const Config = z.object({
+  enabled: z.boolean().default(true).volatile(),
+  includeOff: z.boolean().default(false).volatile(),
+  overwrite: z.boolean().default(false).volatile(),
+  adaptiveCompat: z.boolean().default(true).volatile(),
+});
 
 /**
  * Model ids that pi-ai drives with `thinking.type = "adaptive"`.
@@ -111,6 +139,32 @@ const DEFAULT_LEVELS = {
 };
 
 /**
+ * Defaults for routes that do not speak `anthropic-messages`.
+ *
+ * The five Anthropic levels are not a portable vocabulary. An `openai-responses`
+ * route rejects `xhigh` and `max` at request time, so offering them there would
+ * put a level in the selector that fails every time it is chosen — worse than not
+ * offering it. `low`/`medium`/`high` are the intersection every reasoning API in
+ * pi-ai accepts, and a profile that wants more (the `a1` route spells its top
+ * level `ultra`) declares its own `reasoningEfforts` or overrides `levels`.
+ */
+const PORTABLE_LEVELS = {
+  low: "low",
+  medium: "medium",
+  high: "high",
+};
+
+/**
+ * The default level set for one route.
+ *
+ * @param route - the route being augmented.
+ * @returns the levels to offer when the profile named none.
+ */
+function defaultLevelsFor(route) {
+  return route?.api === "anthropic-messages" ? DEFAULT_LEVELS : PORTABLE_LEVELS;
+}
+
+/**
  * Does this id name one of the adaptive models?
  *
  * Matches exactly, or with a trailing `-<digits>` date stamp
@@ -130,12 +184,18 @@ function escapeRegExp(text) {
 /** Normalize plugin config, tolerating an absent or partial block. */
 export function normalizeConfig(config) {
   const source = config && typeof config === "object" ? config : {};
-  const levels =
-    source.levels && typeof source.levels === "object" && Object.keys(source.levels).length > 0
-      ? { ...source.levels }
-      : { ...DEFAULT_LEVELS };
+  const levelsExplicit = Boolean(
+    source.levels && typeof source.levels === "object" && Object.keys(source.levels).length > 0,
+  );
+  const levels = levelsExplicit ? { ...source.levels } : { ...DEFAULT_LEVELS };
+  // Absent means on. Anything explicitly falsy means off, including `0` and
+  // `""`: the profile schema coerces those to a boolean already, but the loader
+  // can also activate a plugin without schema validation, and reading `0` as "on"
+  // there would silently ignore a user's `enabled: 0`.
   return {
+    enabled: source.enabled === undefined ? true : Boolean(source.enabled),
     levels,
+    levelsExplicit,
     includeOff: source.includeOff === true,
     overwrite: source.overwrite === true,
     adaptiveCompat: source.adaptiveCompat !== false,
@@ -172,11 +232,20 @@ export function buildEfforts(settings) {
  * activation, and a profile plugin has no business editing the user's YAML.
  */
 export function augmentProviders(resolved, settings, report) {
+  if (!settings.enabled) {
+    // Toggled off in Settings: hand back the profile's own config untouched, so
+    // the levels a user wrote into YAML stay authoritative again.
+    return resolved;
+  }
   if (!resolved || typeof resolved !== "object" || !resolved.providers) return resolved;
   if (!resolved.providers || typeof resolved.providers !== "object") return resolved;
 
-  const efforts = buildEfforts(settings);
-  if (Object.keys(efforts).length === 0) return resolved;
+  // A profile that named `levels` gets those everywhere; otherwise each route
+  // falls back to the set its own API can actually accept (see
+  // {@link defaultLevelsFor}).
+  const declared = settings.levelsExplicit;
+  const sharedEfforts = declared ? buildEfforts(settings) : null;
+  if (declared && Object.keys(sharedEfforts).length === 0) return resolved;
 
   let clone;
   try {
@@ -189,7 +258,13 @@ export function augmentProviders(resolved, settings, report) {
 
   for (const [routeId, route] of Object.entries(clone.providers)) {
     if (!route || typeof route !== "object") continue;
-    if (route.api !== "anthropic-messages") continue;
+    // Every route, not just `anthropic-messages`: `reasoningEfforts` is a
+    // DSH-level field, and `resolveModelReasoning` turns it into
+    // `reasoning: true` plus a `thinkingLevelMap` for whatever API the route
+    // speaks. Gating on the API would leave every `openai-responses` and
+    // `google-generative-ai` route with no selector at all — which is most of
+    // them on a machine wired to third-party relays.
+    if (route.api === undefined || route.api === null) continue;
     if (settings.providers && !settings.providers.includes(routeId)) continue;
     if (settings.excludeProviders.includes(routeId)) continue;
     if (!Array.isArray(route.models)) continue;
@@ -200,6 +275,8 @@ export function augmentProviders(resolved, settings, report) {
       if (model.reasoningEfforts === false) continue; // explicitly a non-reasoning model
       if (model.reasoningEfforts !== undefined && !settings.overwrite) continue; // respect the profile
 
+      const efforts = sharedEfforts ?? buildEfforts({ ...settings, levels: defaultLevelsFor(route) });
+      if (Object.keys(efforts).length === 0) continue;
       model.reasoningEfforts = { ...efforts };
       // The listener runs on every config resolution, so the report is deduped
       // rather than appended to; otherwise it would grow without bound.
@@ -221,7 +298,10 @@ export function augmentProviders(resolved, settings, report) {
  * @param config - see {@link normalizeConfig}.
  */
 export function apply(ctx, config) {
-  const settings = normalizeConfig(config);
+  // Held in a mutable box rather than captured once: a Settings toggle rewrites
+  // this entry's volatile config in place, and the listener below must see the
+  // new value on the very next resolution instead of the boot-time snapshot.
+  const state = { settings: normalizeConfig(config) };
   const report = { models: [], adaptive: [], committed: false };
 
   // The listener runs inside config resolution, including the one that starts
@@ -231,7 +311,7 @@ export function apply(ctx, config) {
     const resolved = next();
     try {
       if (!isPiAiFiber(this)) return resolved;
-      return augmentProviders(resolved, settings, report);
+      return augmentProviders(resolved, state.settings, report);
     } catch (error) {
       loggerOf(ctx)?.warn?.(`thinking-effort: left config untouched: ${messageOf(error)}`);
       return resolved;
@@ -271,12 +351,32 @@ export function apply(ctx, config) {
 
     if (report.models.length > 0) {
       loggerOf(ctx)?.info?.(
-        `thinking-effort: ${report.models.length} model(s) now offer ${Object.keys(settings.levels).join("/")}` +
+        `thinking-effort: ${state.settings.enabled ? "on" : "off"} — ` +
+          `${report.models.length} model(s) offer ${Object.keys(state.settings.levels).join("/")}` +
           (report.adaptive.length > 0 ? `, adaptive thinking on ${report.adaptive.length}` : "") +
           ` — ${report.models.join(", ")}`,
       );
     }
   };
+
+  // Re-read this entry's own config, then push the result into llm-pi-ai.
+  const refresh = () => {
+    try {
+      const entry = ctx.loader?.entries?.().find?.((candidate) => candidate?.fiber?.runtime?.name === name);
+      state.settings = normalizeConfig(entry?.options?.config ?? config);
+    } catch {
+      state.settings = normalizeConfig(config);
+    }
+    report.models = [];
+    report.adaptive = [];
+    report.committed = false;
+    kick(0);
+  };
+
+  // The Settings row writes a volatile field, so the loader re-resolves this
+  // entry without restarting it. Re-reading on commit is what makes the toggle
+  // take effect on the running routes rather than on the next boot.
+  ctx.on("loader/volatile-update", refresh);
 
   kick(0);
 }

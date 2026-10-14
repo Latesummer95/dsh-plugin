@@ -536,12 +536,17 @@ window.__ModuleLoader__.load({
 		 */
 		function apply(ctx) {
 			ctx.slots.inject("main", () => ctx.slots.register({ name: "main", key: PANEL_ID }, FingerprintPanel));
-			ctx.slots.inject("sidebar.panellist", () => ctx.slots.register({
-				name: "sidebar.panellist",
-				id: PANEL_ID,
-				order: 42,
-				label: () => "模型指纹检测"
-			}, FingerprintIcon));
+			// Under the merged `dsh-probe` panel this half is a tab, not a rail
+			// button: the merged panel owns the single entry. Registering one here
+			// too would leave the user with three entries for two probes.
+			if (typeof window === "undefined" || window.__DSH_PROBE_MERGED__ !== true) {
+				ctx.slots.inject("sidebar.panellist", () => ctx.slots.register({
+					name: "sidebar.panellist",
+					id: PANEL_ID,
+					order: 42,
+					label: () => "模型指纹检测"
+				}, FingerprintIcon));
+			}
 		}
 
 		Object.assign(module.exports, { FingerprintPanel, ModelPicker, PANEL_ID, apply, inject });

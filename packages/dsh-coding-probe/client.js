@@ -441,12 +441,17 @@ window.__ModuleLoader__.load({
 		 */
 		function apply(ctx) {
 			ctx.slots.inject("main", () => ctx.slots.register({ name: "main", key: PANEL_ID }, ProbePanel));
-			ctx.slots.inject("sidebar.panellist", () => ctx.slots.register({
-				name: "sidebar.panellist",
-				id: PANEL_ID,
-				order: 41,
-				label: () => "编码能力检测"
-			}, ProbeIcon));
+			// Under the merged `dsh-probe` panel this half is a tab, not a rail
+			// button: the merged panel owns the single entry. Registering one here
+			// too would leave the user with three entries for two probes.
+			if (typeof window === "undefined" || window.__DSH_PROBE_MERGED__ !== true) {
+				ctx.slots.inject("sidebar.panellist", () => ctx.slots.register({
+					name: "sidebar.panellist",
+					id: PANEL_ID,
+					order: 41,
+					label: () => "编码能力检测"
+				}, ProbeIcon));
+			}
 		}
 
 		Object.assign(module.exports, { ModelPicker, PANEL_ID, ProbePanel, apply, inject });

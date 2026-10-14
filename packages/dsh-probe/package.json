@@ -1,0 +1,38 @@
+{
+  "name": "dsh-probe",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "One panel, two probes: an executable coding battery and a model fingerprint check, both runnable in the background",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node test/test-merge.mjs"
+  },
+  "dependencies": {
+    "dsh-coding-probe": "^1.0.0",
+    "dsh-fingerprint-probe": "^1.0.0"
+  }
+}

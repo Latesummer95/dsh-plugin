@@ -1,0 +1,45 @@
+# dsh-probe bundle patch.
+#
+# Adds ONE host row: the merged panel that mounts both probes. The two halves
+# (`dsh-coding-probe`, `dsh-fingerprint-probe`) stay independent packages and are
+# pulled in as dependencies, not re-declared here.
+#
+# A patch replaces the targeted row's whole `config`, so this file contains only
+# an additive `insert` row and never restates a shipped row. `name` resolves
+# relative to this file.
+#
+# Optional config — anything outside `coding` / `fingerprint` is shared by both
+# halves, and each half's own slice overrides the shared value:
+#
+#   config:
+#     provider: a1            # shared
+#     concurrency: 1          # shared
+#     coding:
+#       modelPattern: gpt-6
+#       reasoningEffort: high
+#       complexTrials: 3
+#     fingerprint:
+#       modelPattern: deepseek-v4.1-flash
+#       reasoningEffort: null   # this route rejects the level; sending it fails
+#       spacingMs: 1500
+- insert:
+    # The halves stay loader entries: each owns its own routes and its own client
+    # bundle, and `dsh-probe/client.js` requires them by name. They no longer add
+    # a rail button — `window.__DSH_PROBE_MERGED__` turns each into a tab instead.
+    - id: coding-probe
+      name: 'dsh-coding-probe'
+    - id: fingerprint-probe
+      name: 'dsh-fingerprint-probe'
+    - id: probe
+      name: './index.js'
+      config:
+        provider: a1
+        concurrency: 1
+        coding:
+          modelPattern: gpt-6
+          reasoningEffort: high
+          complexTrials: 3
+        fingerprint:
+          modelPattern: deepseek-v4.1-flash
+          reasoningEffort: null
+          spacingMs: 1500

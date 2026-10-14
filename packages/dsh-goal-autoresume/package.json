@@ -5,7 +5,18 @@
   "type": "module",
   "main": "index.js",
   "description": "Re-arm an armed goal after a bounded number of loop-guard step failures so unattended runs keep going",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js"
+  ],
+  "dsh": {},
   "scripts": {
     "test": "node test/test-autoresume.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4"
   }
 }

@@ -147,6 +147,49 @@ const PROBES = [
 		}
 	},
 	{
+		// The "pelican" test, popularized by Simon Willison in 2024 and now the
+		// de-facto open coding-capability benchmark: one prompt, one small SVG, and
+		// a pass/fail a human can check at a glance. It is here as a *target*-tier
+		// probe rather than a control because the interesting property is not "can
+		// you draw" — a degenerate route still emits a plausible rectangle — but
+		// "can you hold a multi-part spatial composition in one pass".
+		id: "pelican",
+		tier: "target",
+		kind: "render",
+		label: "鹈鹕骑自行车（SVG）",
+		about: "2024 年在网络上传开的经典测智商题：一段 SVG，同时画出一只鹈鹕、一辆自行车和一片海。结构简单但要素多，是判断模型是否真的在画而不是在套模板的试金石",
+		prompt: [
+			"Draw a pelican riding a bicycle as a single self-contained SVG.",
+			"The picture must contain ALL of these elements, clearly visible:",
+			"1. A pelican (a bird with a large beak and pouch),",
+			"2. A bicycle with two spoked wheels, a frame, handlebars and a seat,",
+			"3. Water or a shoreline in the background.",
+			"Output ONLY the raw SVG markup, starting with <svg. No HTML wrapper,",
+			"no markdown fences, no explanation, no CSS, no JavaScript.",
+			`Size it around ${800} by ${500}.`
+		].join("\n"),
+		check: (evidence) => {
+			// Graded on what actually painted, not on what the markup claims:
+			//
+			//   - something must have rendered at a usable size;
+			//   - it must not be blank or a single flat fill;
+			//   - it must carry enough distinct colours to be a drawing with parts
+			//     rather than one shape (a blank SVG scores 1-2, a real scene 20+).
+			//
+			// A blank but error-free page is the failure this battery exists to catch,
+			// so `error === null` alone is deliberately not enough.
+			const ok =
+				evidence.error === null &&
+				evidence.nonblackRatio >= 0.01 &&
+				evidence.distinctColors >= 8;
+			return {
+				ok,
+				detail: `nonblack=${round(evidence.nonblackRatio)} colors=${evidence.distinctColors} ` +
+					`size=${evidence.canvasW}x${evidence.canvasH} error=${evidence.error ?? "none"}`
+			};
+		}
+	},
+	{
 		id: "complex_scene",
 		tier: "target",
 		kind: "complex",
@@ -316,30 +359,11 @@ function instrument(html, measure, delayMs = 3000) {
 		try {
 			const canvases = document.querySelectorAll('canvas');
 			payload.canvases = canvases.length;
-			if (canvases.length === 0) { payload.error = payload.error || 'no canvas element'; }
-			else {
+			if (canvases.length > 0) {
 				const c = canvases[0];
-				const w = c.width, h = c.height;
-				payload.canvasW = w; payload.canvasH = h;
-				const tmp = document.createElement('canvas');
-				tmp.width = w; tmp.height = h;
-				const g = tmp.getContext('2d');
-				g.drawImage(c, 0, 0);
-				const data = g.getImageData(0, 0, w, h).data;
-				let green = 0, blue = 0, nonblack = 0, total = 0;
-				const seen = new Set();
-				for (let i = 0; i < w * h; i++) {
-					const r = data[i*4], gg = data[i*4+1], b = data[i*4+2];
-					total++;
-					if (gg > 128 && r < 128 && b < 128) green++;
-					if (b > 128 && r < 128 && gg < 128) blue++;
-					if (r > 12 || gg > 12 || b > 12) nonblack++;
-					seen.add((r >> 4) + ',' + (gg >> 4) + ',' + (b >> 4));
-				}
-				payload.greenRatio = total ? green / total : 0;
-				payload.blueRatio = total ? blue / total : 0;
-				payload.nonblackRatio = total ? nonblack / total : 0;
-				payload.distinctColors = seen.size;
+				measureInto(c, c.width, c.height, false);
+			} else {
+				payload.__pendingSvg = true;
 			}
 		} catch (e) { payload.error = payload.error || String(e); }`
 		: "payload = { error: window.__probeError };";
@@ -361,13 +385,83 @@ window.addEventListener('unhandledrejection', (e) => { if (window.__probeError =
 </script></head><body>
 ${html}
 <script>
-setTimeout(() => {
-	try {
-		${body}
-	} catch (e) { payload = { error: String(e) }; }
-	if (payload === null) payload = { error: window.__probeError };
-	document.title = 'PROBE_RESULT:' + JSON.stringify(payload);
-}, ${Math.max(0, Number(delayMs) || 0)});
+(function () {
+	// Report once the pixel walk is done. The canvas path is synchronous; the
+	// SVG path has to wait for an Image decode, so publishing is deferred until
+	// the measurement it depends on has actually run.
+	function publish() {
+		if (payload === null) payload = { error: window.__probeError };
+		document.title = 'PROBE_RESULT:' + JSON.stringify(payload);
+	}
+	// Walk the pixels of either a <canvas> or an inline <svg>.
+	// An SVG page (the pelican test) draws nothing onto a canvas, so measuring
+	// only <canvas> would score a perfect picture as 0x0. Rasterizing needs an
+	// Image load, which is async, so the caller hands the finished <img> in.
+	function measureInto(source, w, h, blankIsWhite) {
+		payload.canvasW = w; payload.canvasH = h;
+		const tmp = document.createElement('canvas');
+		tmp.width = w; tmp.height = h;
+		const g = tmp.getContext('2d');
+		if (blankIsWhite) {
+			g.fillStyle = '#ffffff';
+			g.fillRect(0, 0, w, h);
+		}
+		g.drawImage(source, 0, 0, w, h);
+		const data = g.getImageData(0, 0, w, h).data;
+		let green = 0, blue = 0, nonblack = 0, total = 0;
+		const seen = new Set();
+		for (let i = 0; i < w * h; i++) {
+			const r = data[i*4], gg = data[i*4+1], b = data[i*4+2];
+			total++;
+			if (gg > 128 && r < 128 && b < 128) green++;
+			if (b > 128 && r < 128 && gg < 128) blue++;
+			// On the SVG path the raster starts white, so near-white is the empty
+			// page rather than ink; counting it would pass a blank drawing.
+			if (blankIsWhite && r > 240 && gg > 240 && b > 240) { /* paper, not ink */ }
+			else if (r > 12 || gg > 12 || b > 12) nonblack++;
+			seen.add((r >> 4) + ',' + (gg >> 4) + ',' + (b >> 4));
+		}
+		payload.greenRatio = total ? green / total : 0;
+		payload.blueRatio = total ? blue / total : 0;
+		payload.nonblackRatio = total ? nonblack / total : 0;
+		payload.distinctColors = seen.size;
+	}
+	function svgFallback() {
+		try {
+			const svgs = document.querySelectorAll('svg');
+			payload.svgs = svgs.length;
+			if (svgs.length === 0) {
+				payload.error = payload.error || 'no canvas or svg element';
+				publish();
+				return;
+			}
+			const s = svgs[0];
+			const box = s.getBoundingClientRect();
+			const w = Math.round(box.width) || Number(s.getAttribute('width')) || 800;
+			const h = Math.round(box.height) || Number(s.getAttribute('height')) || 600;
+			// Cap the raster: a large viewBox would slow the pixel walk and the
+			// verdict does not depend on resolution.
+			const scale = Math.min(1, 1000 / Math.max(w, h));
+			const rw = Math.max(1, Math.round(w * scale));
+			const rh = Math.max(1, Math.round(h * scale));
+			// Inline styles and external references do not survive serialization, so
+			// the markup is wrapped as a standalone document before rasterizing.
+			const markup = new XMLSerializer().serializeToString(s);
+			const url = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(markup);
+			const img = new Image();
+			img.onload = () => { try { measureInto(img, rw, rh, true); } catch (e) { payload.error = payload.error || String(e); } publish(); };
+			img.onerror = () => { payload.error = payload.error || 'svg could not be rasterized'; publish(); };
+			img.src = url;
+		} catch (e) { payload.error = payload.error || String(e); publish(); }
+	}
+	setTimeout(() => {
+		try {
+			${body}
+		} catch (e) { payload = { error: String(e) }; publish(); return; }
+		if (payload && payload.__pendingSvg) { delete payload.__pendingSvg; svgFallback(); return; }
+		publish();
+	}, ${Math.max(0, Number(delayMs) || 0)});
+})();
 </script>
 </body></html>`;
 }
@@ -420,6 +514,7 @@ function measureRender(html, config, measure = true) {
 			canvasW: payload.canvasW ?? 0,
 			canvasH: payload.canvasH ?? 0,
 			canvases: payload.canvases ?? 0,
+			svgs: payload.svgs ?? 0,
 			consoleErrors,
 			domLoaded: dom.length > 0,
 			chromeStatus: result.status

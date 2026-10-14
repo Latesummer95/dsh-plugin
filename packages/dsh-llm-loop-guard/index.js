@@ -23,7 +23,27 @@
  * @module dsh-llm-loop-guard
  */
 
+import z from "@deepseek-ai/schemastery";
+
 const name = "llm-loop-guard";
+
+/** Kept as a named constant so the schema default and {@link DEFAULTS} agree. */
+const DEFAULTS_MAX_ATTEMPT_CHARS = 120000;
+
+/**
+ * The plugin's own settings, surfaced in the Settings page.
+ *
+ * `enabled` is the field the toggle row writes. It is `volatile` so flipping it
+ * does not restart the plugin — a restart would drop every in-flight stream the
+ * guard is currently watching. Instead the flag is read per stream, so the next
+ * LLM call already honours it.
+ */
+export const Config = z.object({
+	enabled: z.boolean().default(true).volatile(),
+	watchReasoning: z.boolean().default(true).volatile(),
+	watchText: z.boolean().default(false).volatile(),
+	maxAttemptChars: z.number().step(1).min(0).default(DEFAULTS_MAX_ATTEMPT_CHARS).volatile()
+});
 
 /** Conservative defaults: trip only on unmistakable verbatim repetition. */
 const DEFAULTS = {
@@ -232,11 +252,28 @@ function guardStream(source, cfg, onTrip) {
  * @param config - optional overrides for {@link DEFAULTS}.
  */
 function apply(ctx, config = {}) {
-	const cfg = {
-		...DEFAULTS,
-		...config
+	// Re-read on every stream so the Settings switch takes effect on the next
+	// call. Holding a boot-time snapshot instead would need a plugin restart,
+	// which would abandon every stream already being watched.
+	const readConfig = () => {
+		try {
+			const entry = ctx.loader?.entries?.().find?.(
+				(candidate) => candidate?.fiber?.runtime?.name === name,
+			);
+			return { ...DEFAULTS, ...(entry?.options?.config ?? config) };
+		} catch {
+			return { ...DEFAULTS, ...config };
+		}
 	};
+
 	ctx.on("llm/stream", (_options, next) => {
+		const cfg = readConfig();
+		// Absent means on; any explicitly falsy value means off. The schema coerces
+		// these to booleans, but the loader can also activate a plugin without
+		// validating its config, and reading `0` as "on" there would silently
+		// ignore a user's `enabled: 0`.
+		if (cfg.enabled !== undefined && !cfg.enabled) return next();
+
 		const stream = next();
 		// `next()` may hand back a promise of the iterable; normalize both shapes.
 		return guardStream(stream, cfg, (trip) => {

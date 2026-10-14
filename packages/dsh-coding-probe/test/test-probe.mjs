@@ -479,6 +479,62 @@ await test("a GET returns the manifest without running the battery", async () =>
 	assert.equal(streamed, false, "GET must not call the model route");
 });
 
+console.log("鹈鹕探针与 SVG 渲染");
+
+await test("the battery declares the pelican probe as a target-tier render", () => {
+	const pelican = PROBES.find((probe) => probe.id === "pelican");
+	assert.ok(pelican, "缺少 pelican 探针");
+	assert.equal(pelican.tier, "target", "鹈鹕属于复杂任务，不是对照组");
+	assert.equal(pelican.kind, "render");
+	assert.match(pelican.prompt, /<svg/, "提示词要求直接输出 SVG");
+	assert.match(pelican.prompt, /pelican/i);
+	assert.match(pelican.prompt, /bicycle/i);
+});
+
+await test("a drawing with real ink passes the pelican check", () => {
+	// The measured calibration: the real SVG pelican rasterized to 200 colours
+	// and ~22% non-white pixels.
+	const ok = PROBES.find((p) => p.id === "pelican").check({
+		error: null, nonblackRatio: 0.2162, distinctColors: 200, canvasW: 626, canvasH: 382
+	});
+	assert.equal(ok.ok, true, ok.detail);
+});
+
+await test("a blank SVG fails even though nothing threw", () => {
+	// The failure this battery exists to catch: no exception, no picture.
+	const ok = PROBES.find((p) => p.id === "pelican").check({
+		error: null, nonblackRatio: 0, distinctColors: 1, canvasW: 800, canvasH: 500
+	});
+	assert.equal(ok.ok, false);
+});
+
+await test("an uncaught page error fails the pelican check", () => {
+	const ok = PROBES.find((p) => p.id === "pelican").check({
+		error: "ReferenceError: x is not defined", nonblackRatio: 0.5, distinctColors: 90
+	});
+	assert.equal(ok.ok, false);
+});
+
+await test("a nearly-blank drawing does not pass on colour count alone", () => {
+	// One off-colour pixel on an otherwise empty page: 1% threshold is below this,
+	// but 8 distinct colours is too, so it must still fail rather than squeak by.
+	const ok = PROBES.find((p) => p.id === "pelican").check({
+		error: null, nonblackRatio: 0.005, distinctColors: 3, canvasW: 800, canvasH: 500
+	});
+	assert.equal(ok.ok, false);
+});
+
+await test("the instrumented page measures SVG when there is no canvas", () => {
+	// The regression that made a perfect drawing score 0x0: the pixel walk only
+	// looked at <canvas>, so an SVG-only page read as an empty one.
+	const page = instrument("<svg xmlns='http://www.w3.org/2000/svg'></svg>", true, 100);
+	assert.match(page, /querySelectorAll\('svg'\)/, "没有 SVG 分支");
+	assert.match(page, /measureInto/, "没有像素统计函数");
+	assert.match(page, /XMLSerializer/, "SVG 没有被序列化");
+	// A canvas page must still take the synchronous path.
+	assert.match(page, /querySelectorAll\('canvas'\)/);
+});
+
 console.log("background run");
 
 await test("a POST acknowledges the start without waiting for the battery", async () => {

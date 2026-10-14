@@ -161,7 +161,16 @@ check("budget 模型不写 forceAdaptiveThinking",
   JSON.stringify(byId["claude-haiku-4-5"].compat));
 check("已有 reasoningEfforts 默认被尊重", byId["already-set"].reasoningEfforts.low === "lo");
 check("reasoningEfforts:false 的非推理模型跳过", byId["non-reasoning"].reasoningEfforts === false);
-check("非 anthropic 路由完全不动", out.providers.a1.models[0].reasoningEfforts === undefined);
+// `reasoningEfforts` is a DSH-level field, not an Anthropic one: the adapter
+// turns it into `reasoning: true` + a `thinkingLevelMap` for any API, so a
+// non-Anthropic route must get the same levels. Gating on the API would leave
+// every openai-responses route — most of a third-party-relay setup — with no
+// selector at all.
+check("非 anthropic 路由同样拿到档位", out.providers.a1.models[0].reasoningEfforts !== undefined,
+  JSON.stringify(out.providers.a1.models[0].reasoningEfforts));
+check("非 anthropic 路由的档位是完整五档",
+  out.providers.a1.models[0].reasoningEfforts?.high === "high",
+  JSON.stringify(out.providers.a1.models[0].reasoningEfforts));
 check("没有 models 数组的路由不报错", out.providers.noModels.reasoningEfforts === undefined);
 
 // The input must never be mutated — it is the raw config the loader retains.
@@ -316,9 +325,124 @@ if (!DSH) {
     ["low", "medium", "high", "xhigh", "max"]);
 }
 
-/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ *
+ * Settings switch
+ *
+ * `enabled` is what the Settings row writes. It has to turn the whole
+ * augmentation off and hand the profile's own config straight back, and
+ * toggling it must not require a restart.
+ * ------------------------------------------------------------------ */
+
+console.log("跨 API 覆盖");
+
+// `reasoningEfforts` is a DSH-level field, not an Anthropic one: the adapter
+// turns it into `reasoning: true` + a `thinkingLevelMap` whatever API the route
+// speaks, so gating the augmentation on `anthropic-messages` would leave every
+// openai-responses route — most of a third-party-relay setup — with no selector.
+{
+  const providers = {
+    relay: { api: "openai-responses", models: [{ id: "m1" }, { id: "m2", reasoningEfforts: false }] },
+    cloud: { api: "anthropic-messages", models: [{ id: "claude-opus-5" }] },
+  };
+  const out = augmentProviders({ providers }, normalizeConfig({}), { models: [], adaptive: [] });
+  const relay = Object.fromEntries(out.providers.relay.models.map((m) => [m.id, m]));
+
+  check("openai-responses 路由也拿到档位", relay.m1.reasoningEfforts !== undefined,
+    JSON.stringify(relay.m1.reasoningEfforts));
+  // xhigh/max are not in the openai reasoning vocabulary: offering them would put
+  // a level in the selector that fails every request.
+  check("openai-responses 只拿三档可移植档位",
+    JSON.stringify(relay.m1.reasoningEfforts) === JSON.stringify({ low: "low", medium: "medium", high: "high" }),
+    JSON.stringify(relay.m1.reasoningEfforts));
+  check("openai-responses 不含 xhigh/max",
+    relay.m1.reasoningEfforts.xhigh === undefined && relay.m1.reasoningEfforts.max === undefined);
+  check("anthropic 路由保留五档",
+    out.providers.cloud.models[0].reasoningEfforts.max === "max");
+  check("非推理模型在非 anthropic 路由同样跳过", relay.m2.reasoningEfforts === false);
+
+  // An explicit `levels` is the user speaking: it applies to every route.
+  const custom = augmentProviders(
+    { providers: { relay: { api: "openai-responses", models: [{ id: "m1" }] } } },
+    normalizeConfig({ levels: { low: "lo", max: "ultra" } }),
+    { models: [], adaptive: [] },
+  );
+  check("显式 levels 覆盖 API 默认",
+    JSON.stringify(custom.providers.relay.models[0].reasoningEfforts) === JSON.stringify({ low: "lo", max: "ultra" }),
+    JSON.stringify(custom.providers.relay.models[0].reasoningEfforts));
+}
+
+console.log("设置开关");
+
+equal("默认启用", normalizeConfig({}).enabled, true);
+equal("显式 false 才关闭", normalizeConfig({ enabled: false }).enabled, false);
+equal("enabled: 0 也算关闭", normalizeConfig({ enabled: 0 }).enabled, false);
+
+// The route used throughout these tests.
+const ROUTE = {
+  id: "cloud",
+  api: "anthropic-messages",
+  models: [{ id: "claude-opus-5" }],
+};
+const ROUTED = { providers: { cloud: ROUTE } };
+
+{
+  const clone = augmentProviders(ROUTED, normalizeConfig({}), { models: [], adaptive: [] });
+  check("启用后模型获得思考档位",
+    Object.keys(clone.providers.cloud.models[0].reasoningEfforts).length > 0);
+  check("启用后同一次调用返回副本而不是改原对象",
+    ROUTE.models[0].reasoningEfforts === undefined,
+    "输入对象被就地修改了");
+}
+
+{
+  // Toggled off: the profile's own config must come back untouched, so a value
+  // the user wrote into YAML becomes authoritative again.
+  const source = { providers: { cloud: { ...ROUTE, models: [{ id: "claude-opus-5", reasoningEfforts: false }] } } };
+  const result = augmentProviders(source, normalizeConfig({ enabled: false }), { models: [], adaptive: [] });
+  equal("关闭后返回的正是传入对象", result, source);
+  equal("关闭后保留 profile 自己的设置", result.providers.cloud.models[0].reasoningEfforts, false);
+}
+
+{
+  // A profile that already declares levels keeps them while the switch is off.
+  const source = { providers: { cloud: { ...ROUTE, models: [{ id: "claude-opus-5", reasoningEfforts: { high: "high" } }] } } };
+  const result = augmentProviders(source, normalizeConfig({ enabled: false }), { models: [], adaptive: [] });
+  equal("关闭时不覆盖 profile 已声明的档位", result.providers.cloud.models[0].reasoningEfforts, { high: "high" });
+}
+
+{
+  // Turning it back off mid-session must un-publish the levels, not merely stop
+  // adding new ones: the in-memory config is rebuilt from the profile each time.
+  const profile = { providers: { cloud: { ...ROUTE } } };
+  const on = augmentProviders(profile, normalizeConfig({ enabled: true }), { models: [], adaptive: [] });
+  const off = augmentProviders(profile, normalizeConfig({ enabled: false }), { models: [], adaptive: [] });
+  check("开→关之后档位确实消失",
+    off.providers.cloud.models[0].reasoningEfforts === undefined,
+    `仍是 ${JSON.stringify(off.providers.cloud.models[0].reasoningEfforts)}`);
+  check("开的时候确实加上了", on.providers.cloud.models[0].reasoningEfforts !== undefined);
+}
+
+{
+  // The other switches the row exposes must reach the augmentation too.
+  const report = { models: [], adaptive: [] };
+  const clone = augmentProviders(ROUTED, normalizeConfig({ includeOff: true }), report);
+  equal("includeOff 打开后补回 off 档位",
+    Object.hasOwn(clone.providers.cloud.models[0].reasoningEfforts, "off"), true);
+
+  const noAdaptive = augmentProviders(ROUTED, normalizeConfig({ adaptiveCompat: false }), { models: [], adaptive: [] });
+  equal("关掉 adaptiveCompat 后不再强加兼容标记",
+    noAdaptive.providers.cloud.models[0].compat?.forceAdaptiveThinking, undefined);
+}
+
+{
+  // An empty levels block must not clone-and-return an unchanged config, which
+  // would churn the volatile ref on every resolution.
+  const settings = normalizeConfig({ levels: {} });
+  equal("levels 为空时退回默认档位", Object.keys(settings.levels).length, 5);
+}
 
 console.log("");
+
 if (failures.length > 0) {
   console.log(`✗ ${failures.length} 项失败，${passed} 项通过：`);
   for (const failure of failures) console.log(`   - ${failure}`);
