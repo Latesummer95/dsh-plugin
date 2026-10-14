@@ -8,25 +8,26 @@ DSH 侧栏插件：判断一条 API 路由**实际**在服务哪个模型。
 
 ## 它做什么
 
-1. 生成 3 条挑战：条数从 292–332 随机取且互不相同，语言在中文／英文／日文／韩文／法文中各自独立抽取，并要求模型不得借助任何工具或代码。
+1. 生成 3 条挑战：条数从 292–332 随机取且互不相同，语言从**你勾选的语言**中各自独立抽取，并要求模型不得借助任何工具或代码。
 2. 通过 DSH 自己的 `ctx.llm` 路由请求——走的就是 agent 平时走的那条路（含鉴权、推理档位、限流），而不是另起一套 HTTP。
 3. 解析回复里最长的一段 1–355 整数，按上游判据要求有效数量 ≥ `max(80, ⌈0.55 × 目标⌉)`。
 4. 三条都有效时，用冻结的参考检测器排名并给出校准置信度；不足三条则明确标记为「部分样本」，不附置信度。
 
 ## 安装
 
-把包链接进 profile，并在 `~/.dsh/profiles/web/cordis.patch.yml` 里挂上：
+把包链接进 profile，并在 `~/.dsh/profiles/<profile>/cordis.patch.yml` 里挂上：
 
 ```yaml
-plugins:
-  dsh-fingerprint-probe:
-    provider: a1          # 要检测的 provider 路由
-    modelPattern: gpt-6   # 可选：按子串过滤；面板里可自行改选
-    reasoningEffort: null # 默认不发送该字段
-    maxTokens: 8000
-    timeoutMs: 180000
-    concurrency: 1
-    spacingMs: 1500
+- insert:
+    - id: fingerprint-probe
+      name: dsh-fingerprint-probe
+      config:
+        provider: ""          # 空 = 用 profile 里已配置的全部 provider；模型在面板上勾
+        reasoningEffort: null # 默认不发送该字段
+        maxTokens: 8000
+        timeoutMs: 180000
+        concurrency: 1
+        spacingMs: 1500
 ```
 
 `reasoningEffort` 默认为 `null`（不发送该字段）。若路由不接受某个档位，带上它会让每条挑战都失败，看起来像模型不可达——所以默认是省略而不是猜一个值。
@@ -35,24 +36,38 @@ plugins:
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
-| `provider` | `a1` | 默认探测的 provider |
-| `models` | `[]` | 显式 `provider/model` 列表，设置后覆盖 `provider` + `modelPattern` |
-| `modelPattern` | — | 按子串过滤模型 id |
+| `provider` | `""` | 探测哪个 provider；**空表示 profile 里已配置的全部 provider**，不写死任何路由 |
+| `modelPattern` | `""` | 按子串过滤模型 id；空表示不过滤 |
+| `models` | `[]` | 显式 `provider/model` 列表，设置后覆盖上面两项 |
+| `languages` | `[]` | 挑战语言；**空表示全部五种**，面板里可自行改选 |
 | `reasoningEffort` | `null` | 转发给路由的推理档位；`null` 表示不发送 |
 | `maxTokens` | `8000` | 单条挑战的输出上限 |
 | `timeoutMs` | `180000` | 单次请求墙钟预算 |
 | `concurrency` | `1` | 并发模型数；网关限流严格，默认串行 |
 | `spacingMs` | `1500` | 模型之间与挑战之间的间隔 |
 
+模型默认值不写死 provider 是有原因的：这个插件会被装进各种 profile，而 `a1` 只是作者自己的网关路由。写死它的话，别的 profile 上要么 `listModels` 直接失败，要么预勾一批用户从没配过的模型。默认值改为通过 `llm.listProviders()` / `listModels()` 发现当前 profile 实际配置的路由；单个 provider 读不到不影响其余，只有全部读不到才报错。
+
 面板里勾选的模型会作为显式列表随请求发送，所以检测永远不会悄悄换成另一组模型。
+
+## 选挑战语言
+
+参考库是用这五种语言的提示词环境采集的（中文／英文／日文／韩文／法文），所以**语言是这个探针唯一的「检测内容」维度**。
+
+面板上五种语言单独可勾，默认全选——也就是原来的行为（每条挑战的语言独立随机抽取）。只勾中文就只测中文：代价按比例下降，回答的问题也更窄（「这条路由在中文提示词下像谁」）。
+
+- 提示词模板保持采集时的原文，**不做任何改写**；缩小语言池只是少用几个模板
+- **字段缺失 = 全部五种**，旧客户端和脚本调用保持兼容
+- **显式传空数组返回 400**，而不是悄悄从五种语言里抽
+- 每条挑战实际用了哪种语言会记在结果里，面板逐条显示——否则「忽略了你的选择」和「遵守了你的选择」看起来会一模一样
 
 ## 路由
 
 | 路由 | 方法 | 说明 |
 | --- | --- | --- |
-| `/fingerprint-probe/models` | GET | 模型目录 + 参考库摘要 + 缓存状态。打开面板只调这个，不会触发下载或检测 |
+| `/fingerprint-probe/models` | GET | 模型目录 + 语言菜单 + 参考库摘要 + 缓存状态。打开面板只调这个，不会触发下载或检测 |
 | `/fingerprint-probe/run` | GET | 报告当前检测的状态，立即返回：`idle` / `running`（带已完成的部分结果）/ `done` / `error` |
-| `/fingerprint-probe/run` | POST | **启动**检测，立即返回 `202 {phase:"running", id}`；body 为 `{"models": ["provider/model", …]}` |
+| `/fingerprint-probe/run` | POST | **启动**检测，立即返回 `202 {phase:"running", id}`；body 为 `{"models": ["provider/model", …], "languages": ["zh", "en"]}`。两个字段都不带则用 profile 配置的模型 + 全部语言；`languages` 显式传空数组返回 `400` |
 
 ### 检测跑在后台，不绑在请求上
 
@@ -74,8 +89,14 @@ plugins:
 
 ```bash
 node test/fetch-fixtures.mjs   # 拉取参考回答夹具（16 MB，不入库）
-node test/test-detector.mjs
+node test/test-detector.mjs    # 79 项
+node test/test-client.mjs      # 11 项
 ```
+
+`test-client.mjs` 在桩 module loader 下装载**真实的客户端 bundle**，遍历组件生成的元素树。
+它存在的直接原因是 `models` 那个回归：面板里引用了一个只存在于 `ModelPicker` 作用域内的裸
+`models`，于是「模型列表加载完但一个都没勾」时抛 ReferenceError，整个面板直接挂掉——
+而这恰好就是硬编码 `a1` 在别的 profile 上的状态。**读源码没发现，遍历元素树发现了**。
 
 测试分三类，只有第三类能证明东西：
 

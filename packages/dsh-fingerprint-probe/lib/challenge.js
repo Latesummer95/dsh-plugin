@@ -199,7 +199,32 @@ const LANGUAGES = {
 	}
 };
 
-const TEMPLATES = Object.values(LANGUAGES);
+/** Language ids in a stable order, for enumerating the selection. */
+const LANGUAGE_IDS = Object.keys(LANGUAGES);
+
+/** Display names for the picker, kept next to the data they describe. */
+const LANGUAGE_LABELS = { zh: "中文", en: "English", ja: "日本語", ko: "한국어", fr: "Français" };
+
+/**
+ * Resolve a requested language selection into `[id, template]` pairs.
+ *
+ * An empty or absent selection means every language, which is the historical
+ * behaviour: a round used to draw each challenge's language independently from
+ * all five. Narrowing the pool does not paraphrase anything — it only removes
+ * templates, so the wording a challenge does use is still verbatim.
+ *
+ * @param ids - requested language ids.
+ * @returns a non-empty pool.
+ */
+function templatePool(ids) {
+	const all = Object.entries(LANGUAGES);
+	if (!Array.isArray(ids) || ids.length === 0) return all;
+	const chosen = ids
+		.map((id) => String(id).trim())
+		.filter((id) => LANGUAGES[id] !== undefined)
+		.map((id) => [id, LANGUAGES[id]]);
+	return chosen.length > 0 ? chosen : all;
+}
 
 /**
  * Draw one round of challenges.
@@ -207,14 +232,20 @@ const TEMPLATES = Object.values(LANGUAGES);
  * @param count - how many challenges to draw (three for a scorable round).
  * @param usedLengths - counts already used this session, kept distinct so a
  *   replacement prompt cannot duplicate a challenge still in play.
- * @returns challenges with a stable id, the expected count, and the prompt.
+ * @param languages - language ids to draw from; empty means all of them.
+ * @returns challenges with a stable id, the expected count, the language they
+ *   were worded in, and the prompt.
  */
-export function generateChallenges(count = 3, usedLengths = []) {
+export function generateChallenges(count = 3, usedLengths = [], languages = []) {
+	const pool = templatePool(languages);
 	return uniqueLengths(count, usedLengths).map((length, index) => {
-		const language = choose(TEMPLATES);
+		// The id travels with the challenge so the panel can report which
+		// language a round actually used, rather than guessing from the text.
+		const [languageId, language] = choose(pool);
 		return {
 			id: `probe-${index + 1}-${crypto.randomUUID()}`,
 			expected_count: length,
+			language: languageId,
 			prompt: [
 				choose(language.openings),
 				language.request(choose(language.actions), length),
@@ -227,4 +258,4 @@ export function generateChallenges(count = 3, usedLengths = []) {
 	});
 }
 
-export { LANGUAGES };
+export { LANGUAGES, LANGUAGE_IDS, LANGUAGE_LABELS };

@@ -38,7 +38,7 @@
  * @module dsh-fingerprint-probe
  */
 
-import { generateChallenges } from "./lib/challenge.js";
+import { generateChallenges, LANGUAGE_IDS, LANGUAGE_LABELS } from "./lib/challenge.js";
 import { loadReference, loadBankMeta, cacheStatus, UPSTREAM } from "./lib/data.js";
 import { analyzeOutputs, parseNumbers, REQUIRED_OUTPUTS } from "./lib/detector.js";
 
@@ -59,10 +59,28 @@ const inject = ["webServer", "llm"];
 
 /** Conservative defaults; every field is overridable from the profile patch. */
 const DEFAULTS = {
-	/** Provider route to probe. */
-	provider: "a1",
+	/**
+	 * Provider route to probe; empty means every provider the profile has
+	 * configured.
+	 *
+	 * Not a vendor id baked into the source: this plugin is installed into
+	 * arbitrary profiles, and a hard-coded route either fails `listModels`
+	 * outright or preselects models the user never configured.
+	 */
+	provider: "",
+	/** Substring filter applied to the configured models; empty means no filter. */
+	modelPattern: "",
 	/** Explicit `provider/model` list; overrides provider + modelPattern when set. */
 	models: [],
+	/**
+	 * Challenge languages to draw from; empty means all five.
+	 *
+	 * The reference bank was collected with these prompt environments, so the
+	 * language is the one axis of "what to detect" this probe has. Restricting
+	 * it answers a narrower question — "what does this route look like in
+	 * Chinese" — at a proportionally smaller cost.
+	 */
+	languages: [],
 	/** Reasoning effort forwarded to the route; `null` omits the field entirely. */
 	reasoningEffort: null,
 	/** Max output tokens per challenge. 292–332 integers need room, not depth. */
@@ -115,9 +133,15 @@ function parseSelection(entries, fallbackProvider) {
  * Resolve which models to probe.
  *
  * Precedence, highest first: the panel's explicit selection, then a pinned
- * `config.models` list, then `config.provider` + `config.modelPattern`. The
- * panel always sends a selection, so a detection never silently grades a
- * different set than the user ticked.
+ * `config.models` list, then the profile's own configured routes
+ * (`config.provider` when set, otherwise every provider `llm` reports,
+ * optionally narrowed by `config.modelPattern`). The panel always sends a
+ * selection, so a detection never silently grades a different set than the
+ * user ticked.
+ *
+ * The last step is what keeps this plugin free of a baked-in vendor id: it
+ * reads the catalog `llm` built from the profile, so the default is "what this
+ * machine is actually configured with".
  *
  * @param ctx - the plugin context.
  * @param config - the resolved plugin config.
@@ -127,10 +151,72 @@ function parseSelection(entries, fallbackProvider) {
 async function resolveTargets(ctx, config, requested) {
 	if (Array.isArray(requested) && requested.length > 0) return parseSelection(requested, config.provider);
 	if (Array.isArray(config.models) && config.models.length > 0) return parseSelection(config.models, config.provider);
-	const models = await ctx.llm.listModels(config.provider);
 	const pattern = String(config.modelPattern ?? "");
-	const filtered = pattern.length === 0 ? models : models.filter((m) => String(m.id).includes(pattern));
-	return filtered.map((m) => ({ provider: config.provider, model: m.id }));
+	const targets = [];
+	const failed = [];
+	for (const provider of configuredProviders(ctx, config)) {
+		try {
+			for (const model of await ctx.llm.listModels(provider)) {
+				const id = String(model?.id ?? "");
+				if (id.length === 0) continue;
+				if (pattern.length > 0 && !id.includes(pattern)) continue;
+				targets.push({ provider, model: id });
+			}
+		} catch (error) {
+			// One unreachable route must not blank the default selection, but a
+			// total failure has to surface: an empty list would otherwise read
+			// as "you configured no models".
+			failed.push(`${provider}（${error instanceof Error ? error.message : String(error)}）`);
+		}
+	}
+	if (targets.length === 0 && failed.length > 0) {
+		throw new Error(`无法读取已配置的模型：${failed.join("；")}`);
+	}
+	return targets;
+}
+
+/**
+ * The provider routes the profile has configured.
+ *
+ * An explicit `config.provider` wins; otherwise this is whatever `llm` reports
+ * as configured, so the plugin never names a vendor the profile may not define.
+ *
+ * @param ctx - the plugin context.
+ * @param config - the resolved plugin config.
+ * @returns provider ids, possibly empty when nothing is configured.
+ */
+function configuredProviders(ctx, config) {
+	const explicit = String(config?.provider ?? "").trim();
+	if (explicit.length > 0) return [explicit];
+	const listed = ctx.llm?.listProviders?.() ?? [];
+	const ids = listed
+		.map((p) => String(p?.id ?? p?.provider ?? p?.name ?? ""))
+		.filter((id) => id.length > 0);
+	return Array.from(new Set(ids));
+}
+
+/**
+ * The languages a round may draw from.
+ *
+ * Absent means every language; an explicit selection is filtered to known ids,
+ * so a stale client cannot ask for a template that does not exist.
+ *
+ * @param ids - requested language ids, or `undefined` for "all".
+ * @returns known language ids, in the canonical order; empty means all.
+ */
+function resolveLanguages(ids) {
+	if (!Array.isArray(ids)) return [];
+	const wanted = new Set(ids.map((id) => String(id).trim()));
+	return LANGUAGE_IDS.filter((id) => wanted.has(id));
+}
+
+/**
+ * Describe the language menu for the panel.
+ *
+ * @returns serialisable descriptors.
+ */
+function describeLanguages() {
+	return LANGUAGE_IDS.map((id) => ({ id, label: LANGUAGE_LABELS[id] ?? id }));
 }
 
 /**
@@ -187,24 +273,65 @@ async function readBody(req) {
 }
 
 /**
+ * Read and parse a POST body once.
+ *
+ * The request stream can only be consumed a single time, so the model and the
+ * language selection have to come out of this one read — reading the body twice
+ * would silently lose whichever field came second.
+ *
+ * @param req - the incoming request.
+ * @returns the parsed object, or `{}` when absent, oversized, or not an object.
+ */
+async function readRequest(req) {
+	const text = await readBody(req);
+	if (text.trim().length === 0) return {};
+	try {
+		const body = JSON.parse(text);
+		return body !== null && typeof body === "object" && !Array.isArray(body) ? body : {};
+	} catch {
+		return {};
+	}
+}
+
+/**
+ * Read the requested model selection out of a parsed body.
+ *
+ * @param body - the parsed POST body.
+ * @returns the selection, or `undefined` to fall back to the configured targets.
+ */
+function selectionFrom(body) {
+	const raw = body?.models ?? body?.targets;
+	if (!Array.isArray(raw)) return undefined;
+	const cleaned = raw.map((m) => String(m).trim()).filter((m) => m.length > 0);
+	return cleaned.length > 0 ? cleaned : undefined;
+}
+
+/**
+ * Read the requested language selection out of a parsed body.
+ *
+ * Absent means "every language" (an older client, or a scripted run). A
+ * present-but-empty selection is reported as an empty array rather than
+ * silently upgraded to all five: the route turns that into a 400, because
+ * drawing from every language when the user asked for none would be the
+ * expensive version of ignoring them.
+ *
+ * @param body - the parsed POST body.
+ * @returns the requested language ids, or `undefined` when the field is absent.
+ */
+function languagesFrom(body) {
+	const raw = body?.languages;
+	if (!Array.isArray(raw)) return undefined;
+	return resolveLanguages(raw);
+}
+
+/**
  * Read the requested model selection from a POST body.
  *
  * @param req - the incoming request.
  * @returns the selection, or `undefined` to fall back to the configured targets.
  */
 async function readSelection(req) {
-	const text = await readBody(req);
-	if (text.trim().length === 0) return undefined;
-	let body;
-	try {
-		body = JSON.parse(text);
-	} catch {
-		return undefined;
-	}
-	const raw = body?.models ?? body?.targets;
-	if (!Array.isArray(raw)) return undefined;
-	const cleaned = raw.map((m) => String(m).trim()).filter((m) => m.length > 0);
-	return cleaned.length > 0 ? cleaned : undefined;
+	return selectionFrom(await readRequest(req));
 }
 
 /**
@@ -279,6 +406,7 @@ async function elicit(ctx, target, challenge, config) {
 		const accepted = !failed && numbers.length >= minimum;
 		return {
 			challengeId: challenge.id,
+			language: challenge.language,
 			expected: challenge.expected_count,
 			minimum,
 			accepted,
@@ -315,6 +443,7 @@ async function elicit(ctx, target, challenge, config) {
 	} catch (error) {
 		return {
 			challengeId: challenge.id,
+			language: challenge.language,
 			expected: challenge.expected_count,
 			minimum: minimumNumbers(challenge.expected_count),
 			accepted: false,
@@ -349,7 +478,7 @@ async function probeModel(ctx, target, reference, config, onProgress) {
 	// challenge still in play, matching how the reference bank was collected.
 	const used = [];
 	const draw = () => {
-		const [challenge] = generateChallenges(1, used);
+		const [challenge] = generateChallenges(1, used, config.languages);
 		used.push(challenge.expected_count);
 		return challenge;
 	};
@@ -359,7 +488,7 @@ async function probeModel(ctx, target, reference, config, onProgress) {
 		let attempt;
 		for (let retry = 0; retry <= config.replacements; retry += 1) {
 			onProgress?.(
-				`${label}：挑战 ${slot + 1}/${REQUIRED_OUTPUTS}（要求 ${challenge.expected_count} 个整数）` +
+				`${label}：挑战 ${slot + 1}/${REQUIRED_OUTPUTS}（${LANGUAGE_LABELS[challenge.language] ?? challenge.language}，要求 ${challenge.expected_count} 个整数）` +
 					(retry > 0 ? `，第 ${retry + 1} 次尝试` : "")
 			);
 			attempt = await elicit(ctx, target, challenge, config);
@@ -546,7 +675,19 @@ function apply(ctx, config = {}) {
 						res.end();
 						return;
 					}
-					const requested = req.method === "POST" ? await readSelection(req) : undefined;
+					// The body is read exactly once — see {@link readRequest}.
+					const body = req.method === "POST" ? await readRequest(req) : {};
+					const requested = req.method === "POST" ? selectionFrom(body) : undefined;
+					const askedLanguages = req.method === "POST" ? languagesFrom(body) : undefined;
+					if (req.method === "POST" && Array.isArray(body.languages) && askedLanguages.length === 0) {
+						// An explicit empty selection is a client bug, not a
+						// request to draw from every language.
+						sendJson(res, 400, { error: "请至少选择一种挑战语言" });
+						return;
+					}
+					// An absent field means every language; an explicit one is
+					// already filtered to known ids.
+					const languages = askedLanguages === undefined ? [] : askedLanguages;
 					let targets;
 					try {
 						targets = await resolveTargets(ctx, cfg, requested);
@@ -561,6 +702,7 @@ function apply(ctx, config = {}) {
 						timeoutMs: cfg.timeoutMs,
 						upstream: UPSTREAM,
 						cache: cacheStatus(),
+						languages: languages.length > 0 ? languages : [...LANGUAGE_IDS],
 						targets: targets.map((t) => `${t.provider}/${t.model}`)
 					};
 					// GET reports the current job's state, or what WOULD run when
@@ -586,7 +728,7 @@ function apply(ctx, config = {}) {
 					// POST starts the job and returns at once. The panel polls GET,
 					// so navigating away mid-run no longer throws the work away.
 					const { job, done } = runs.start(manifest, (live) =>
-						runDetection(ctx, targets, cfg, (message) => ctx.logger?.info("fingerprint-probe: %s", message), live)
+						runDetection(ctx, targets, { ...cfg, languages }, (message) => ctx.logger?.info("fingerprint-probe: %s", message), live)
 					);
 					// Keep the promise observed even though the response has already
 					// been sent, so a rejected detection cannot surface as an
@@ -621,12 +763,37 @@ function apply(ctx, config = {}) {
 					try {
 						const catalog = await listCandidates(ctx);
 						const bank = loadBankMeta();
+						// The language menu needs no download and no detection, so
+						// it ships with the payload the picker already fetches:
+						// one request populates both selectors.
+						const defaultLanguages = cfg.languages.length > 0
+							? resolveLanguages(cfg.languages)
+							: [...LANGUAGE_IDS];
+						let defaults = [];
+						try {
+							defaults = (await resolveTargets(ctx, cfg)).map((t) => `${t.provider}/${t.model}`);
+						} catch {
+							defaults = [];
+						}
+						// Fall back to the catalog only when the config asked for no
+						// restriction at all. A pattern that matches nothing is a
+						// deliberate narrowing whose empty result is the answer —
+						// silently preselecting something else would hide a stale
+						// config behind a plausible-looking run.
+						const restricted = String(cfg.provider ?? "").trim().length > 0
+							|| String(cfg.modelPattern ?? "").trim().length > 0
+							|| (Array.isArray(cfg.models) && cfg.models.length > 0);
+						if (defaults.length === 0 && !restricted) {
+							defaults = catalog.models.map((m) => `${m.provider}/${m.model}`);
+						}
 						sendJson(res, 200, {
 							provider: cfg.provider,
 							modelPattern: cfg.modelPattern ?? null,
 							reasoningEffort: cfg.reasoningEffort,
 							upstream: UPSTREAM,
 							cache: cacheStatus(),
+							languages: describeLanguages(),
+							defaultLanguages: defaultLanguages.length > 0 ? defaultLanguages : [...LANGUAGE_IDS],
 							reference: {
 								builtAt: bank.built_at,
 								models: bank.models.map((m) => ({
@@ -637,7 +804,7 @@ function apply(ctx, config = {}) {
 									responseCount: m.response_count
 								}))
 							},
-							defaults: (await resolveTargets(ctx, cfg)).map((t) => `${t.provider}/${t.model}`),
+							defaults,
 							...catalog
 						});
 					} catch (error) {
@@ -649,8 +816,9 @@ function apply(ctx, config = {}) {
 	);
 
 	ctx.logger?.info(
-		"fingerprint-probe: ready (provider=%s, reference bank %s, upstream %s@%s)",
-		cfg.provider,
+		"fingerprint-probe: ready (provider=%s, languages=%s, reference bank %s, upstream %s@%s)",
+		cfg.provider.length > 0 ? cfg.provider : "(every configured provider)",
+		cfg.languages.length > 0 ? cfg.languages.join("/") : "(all)",
 		loadBankMeta().built_at,
 		UPSTREAM.repo,
 		UPSTREAM.commit.slice(0, 12)
@@ -663,16 +831,22 @@ export {
 	UPSTREAM,
 	apply,
 	cacheStatus,
+	configuredProviders,
+	describeLanguages,
 	elicit,
 	generateChallenges,
 	inject,
+	languagesFrom,
 	listCandidates,
 	loadReference,
 	minimumNumbers,
 	name,
 	parseSelection,
 	probeModel,
+	readRequest,
 	readSelection,
+	resolveLanguages,
 	resolveTargets,
-	runDetection
+	runDetection,
+	selectionFrom
 };

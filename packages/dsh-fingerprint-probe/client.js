@@ -93,6 +93,8 @@ window.__ModuleLoader__.load({
 		const panelState = {
 			/** Ticked `provider/model` ids, or `null` until the catalog loads. */
 			selected: null,
+			/** Ticked challenge language ids, or `null` until the menu loads. */
+			selectedLanguages: null,
 			/** `idle` | `running` | `done` | `error`. */
 			phase: "idle",
 			/** The last report returned by the host, or `null`. */
@@ -142,6 +144,8 @@ window.__ModuleLoader__.load({
 			grid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))", gap: "6px 14px" },
 			modelItem: { display: "flex", alignItems: "center", gap: "7px", fontSize: "12px", cursor: "pointer", minWidth: 0 },
 			modelName: { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+			languageGrid: { display: "flex", flexWrap: "wrap", gap: "6px 18px" },
+			languageNote: { fontSize: "11px", opacity: 0.58, lineHeight: 1.5 },
 			linkBtn: { background: "none", border: "none", padding: 0, color: "inherit", opacity: 0.7, cursor: "pointer", fontSize: "12px", textDecoration: "underline" },
 			caveat: { border: "1px solid rgba(127,127,127,.2)", borderLeft: "3px solid rgba(127,127,127,.45)", borderRadius: "6px", padding: "9px 12px", fontSize: "11.5px", opacity: 0.72, lineHeight: 1.65 },
 			rank: { display: "flex", flexDirection: "column", gap: "3px" },
@@ -221,6 +225,9 @@ window.__ModuleLoader__.load({
 		 */
 		function AttemptRow({ attempt }) {
 			const detail = [
+				// Which language this challenge was worded in. It is now a user
+				// choice, so the row has to show which one actually ran.
+				attempt.language,
 				`要求 ${attempt.expected}`,
 				`有效 ${attempt.numbers}/${attempt.minimum}`,
 				attempt.outputTokens !== null && attempt.outputTokens !== undefined ? `${attempt.outputTokens} tokens` : null,
@@ -348,6 +355,52 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * The challenge-language picker.
+		 *
+		 * The reference bank was collected in these five prompt languages, so the
+		 * language is the one axis of "what to detect" this probe has. A round
+		 * used to draw each challenge's language at random from all five with no
+		 * way to narrow it; ticking a subset answers a narrower question — "what
+		 * does this route look like in Chinese" — for proportionally less cost.
+		 *
+		 * @param props - language menu, current selection, and change handlers.
+		 * @returns the picker element.
+		 */
+		function LanguagePicker({ languages, selected, onToggle, onSelectAll, onSelectNone, loading }) {
+			const list = languages ?? [];
+			const allSelected = list.length > 0 && list.every((l) => selected.has(l.id));
+			return React.createElement("section", { style: styles.picker },
+				React.createElement("div", { style: styles.pickerHead },
+					React.createElement("span", { style: styles.pickerTitle },
+						loading ? "正在读取语言列表…" : `选择挑战语言（已选 ${list.filter((l) => selected.has(l.id)).length} / ${list.length}）`
+					),
+					React.createElement("span", { style: { display: "flex", gap: "12px", alignItems: "center" } },
+						React.createElement("button", {
+							type: "button", style: styles.linkBtn,
+							onClick: () => (allSelected ? onSelectNone() : onSelectAll()),
+							disabled: loading || list.length === 0
+						}, allSelected ? "全不选" : "全选")
+					)
+				),
+				React.createElement("div", { style: styles.languageGrid },
+					list.map((language) => React.createElement("label", {
+						key: language.id, style: styles.modelItem
+					},
+						React.createElement("input", {
+							type: "checkbox",
+							checked: selected.has(language.id),
+							onChange: () => onToggle(language.id)
+						}),
+						React.createElement("span", null, language.label)
+					))
+				),
+				React.createElement("div", { style: styles.languageNote },
+					"每条挑战的语言从所选语言里抽取；提示词保持参考库采集时的原文，不做改写。"
+				)
+			);
+		}
+
+		/**
 		 * The fingerprint panel.
 		 *
 		 * @returns the panel element.
@@ -365,6 +418,11 @@ window.__ModuleLoader__.load({
 			const [catalogError, setCatalogError] = React.useState(null);
 			const [loadingModels, setLoadingModels] = React.useState(true);
 			const selected = panelState.selected ?? new Set();
+			const selectedLanguages = panelState.selectedLanguages ?? new Set();
+			// The catalog's model list, for the hints below. Referencing it as a
+			// bare identifier used to throw a ReferenceError the moment the list
+			// loaded with nothing ticked, taking the whole panel down with it.
+			const models = catalog?.models ?? [];
 
 			const loadModels = React.useCallback(async () => {
 				setLoadingModels(true);
@@ -374,12 +432,18 @@ window.__ModuleLoader__.load({
 					const payload = await response.json();
 					if (!response.ok) throw new Error(payload?.error ?? `HTTP ${response.status}`);
 					setCatalog(payload);
-					// Preselect the profile's configured targets, but never
-					// overwrite a selection the user already made — reloading the
-					// catalog (or remounting the panel) must not reset the ticks.
+					// Preselect the profile's configured targets and every
+					// language, but never overwrite a selection the user already
+					// made — reloading the catalog (or remounting the panel) must
+					// not reset the ticks.
+					const patch = {};
 					if (panelState.selected === null) {
-						setPanelState({ selected: new Set(payload.defaults ?? []) });
+						patch.selected = new Set(payload.defaults ?? []);
 					}
+					if (panelState.selectedLanguages === null) {
+						patch.selectedLanguages = new Set(payload.defaultLanguages ?? (payload.languages ?? []).map((l) => l.id));
+					}
+					if (Object.keys(patch).length > 0) setPanelState(patch);
 				} catch (error) {
 					setCatalogError(error instanceof Error ? error.message : String(error));
 				} finally {
@@ -439,13 +503,29 @@ window.__ModuleLoader__.load({
 			}, [catalog]);
 			const selectNone = React.useCallback(() => setPanelState({ selected: new Set() }), []);
 
+			const toggleLanguage = React.useCallback((id) => {
+				const next = new Set(panelState.selectedLanguages ?? []);
+				if (next.has(id)) next.delete(id); else next.add(id);
+				setPanelState({ selectedLanguages: next });
+			}, []);
+			const selectAllLanguages = React.useCallback(() => {
+				setPanelState({ selectedLanguages: new Set((catalog?.languages ?? []).map((l) => l.id)) });
+			}, [catalog]);
+			const selectNoLanguages = React.useCallback(() => setPanelState({ selectedLanguages: new Set() }), []);
+
 			const run = React.useCallback(async () => {
 				setPanelState({ phase: "running", report: null, error: null, jobId: null });
 				try {
 					const response = await fetch(api(ROUTE), {
 						method: "POST",
 						headers: { "content-type": "application/json" },
-						body: JSON.stringify({ models: Array.from(panelState.selected ?? []) })
+						body: JSON.stringify({
+							models: Array.from(panelState.selected ?? []),
+							// Send the language selection explicitly: an absent
+							// field means "all five" on the host, so omitting it
+							// would silently draw from languages the user unticked.
+							languages: Array.from(panelState.selectedLanguages ?? [])
+						})
 					});
 					const payload = await response.json();
 					if (!response.ok) throw new Error(payload?.error ?? `HTTP ${response.status}`);
@@ -459,7 +539,7 @@ window.__ModuleLoader__.load({
 
 			const running = panelState.phase === "running";
 			const report = panelState.report;
-			const canRun = !running && !loadingModels && selected.size > 0;
+			const canRun = !running && !loadingModels && selected.size > 0 && selectedLanguages.size > 0;
 			const reference = catalog?.reference;
 
 			return React.createElement("div", { style: styles.root },
@@ -470,12 +550,16 @@ window.__ModuleLoader__.load({
 					),
 					React.createElement("p", { style: styles.sub },
 						"让模型写几百个「随机」整数，再和参考库比对分布——不问它自己是谁，只看它实际怎么取值。",
-						"每个模型跑 3 条挑战，条数与语言随机；三条都有效才给出校准置信度。"
+						"每个模型跑 3 条挑战，条数随机；三条都有效才给出校准置信度。挑战语言可自选。"
 					)
 				),
 				React.createElement(ModelPicker, {
 					catalog, selected, loading: loadingModels, error: catalogError,
 					onToggle: toggle, onSelectAll: selectAll, onSelectNone: selectNone, onReload: loadModels
+				}),
+				React.createElement(LanguagePicker, {
+					languages: catalog?.languages, selected: selectedLanguages, loading: loadingModels,
+					onToggle: toggleLanguage, onSelectAll: selectAllLanguages, onSelectNone: selectNoLanguages
 				}),
 				React.createElement("div", { style: styles.bar },
 					React.createElement(primitives.Button, { variant: "primary", size: "sm", onClick: run, disabled: !canRun },
@@ -483,14 +567,16 @@ window.__ModuleLoader__.load({
 					),
 					selected.size === 0 && !loadingModels &&
 						React.createElement("span", { style: styles.muted },
-							(models?.length ?? 0) > 0
+							models.length > 0
 								? "请至少选择一个模型"
 								: "没有可用的模型"
 						),
-					selected.size === 0 && !loadingModels && (models?.length ?? 0) > 0 && (catalog?.modelPattern ?? null) !== null &&
+					selected.size === 0 && !loadingModels && models.length > 0 && (catalog?.modelPattern ?? null) !== null &&
 						React.createElement("span", { style: styles.muted },
 							`（配置的 modelPattern「${catalog.modelPattern}」没有匹配到模型，请手动勾选）`
 						),
+					selected.size > 0 && selectedLanguages.size === 0 && !loadingModels &&
+						React.createElement("span", { style: styles.muted }, "请至少选择一种挑战语言"),
 					reference
 						? React.createElement("span", { style: styles.muted },
 								`参考库 ${reference.models.length} 个模型` +
@@ -504,9 +590,9 @@ window.__ModuleLoader__.load({
 					"检测在后台进行，可以切到别的对话或别的面板，回来时会自动接上。"
 				),
 				!running && report === null && panelState.error === null &&
-					React.createElement("div", { style: styles.empty }, "选好模型后点击「开始检测」运行指纹检测。"),
+					React.createElement("div", { style: styles.empty }, "选好模型和挑战语言后，点击「开始检测」运行指纹检测。"),
 				report !== null && (report.models?.length ?? 0) === 0 &&
-					React.createElement("div", { style: styles.empty }, "没有匹配到模型。请检查插件的 provider / models 配置。"),
+					React.createElement("div", { style: styles.empty }, "没有匹配到模型。请检查插件配置，或在模型列表里重新勾选。"),
 				report !== null && (report.models?.length ?? 0) > 0 &&
 					React.createElement("div", { style: styles.caveat },
 						"结果说明：这是「在参考库 58 个模型里的相对排名」，不是身份证明。",
@@ -549,7 +635,7 @@ window.__ModuleLoader__.load({
 			}
 		}
 
-		Object.assign(module.exports, { FingerprintPanel, ModelPicker, PANEL_ID, apply, inject });
+		Object.assign(module.exports, { AttemptRow, FingerprintPanel, LanguagePicker, ModelPicker, PANEL_ID, apply, inject });
 		return module.exports;
 	}
 });

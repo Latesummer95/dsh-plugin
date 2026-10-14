@@ -21,7 +21,7 @@
     }
   },
   "scripts": {
-    "test": "node test/test-detector.mjs",
+    "test": "node test/test-detector.mjs && node test/test-client.mjs",
     "fetch-data": "node test/fetch-fixtures.mjs"
   },
   "engines": {

@@ -31,11 +31,17 @@ import {
 	ROUTE_PREFIX,
 	UPSTREAM,
 	apply,
+	configuredProviders,
 	inject,
+	languagesFrom,
 	minimumNumbers,
 	parseSelection,
 	probeModel,
-	readSelection
+	readRequest,
+	readSelection,
+	resolveLanguages,
+	resolveTargets,
+	selectionFrom
 } from "../index.js";
 import { generateChallenges } from "../lib/challenge.js";
 import {
@@ -916,6 +922,152 @@ await test("every reference model carries the fields the panel renders", () => {
 await test("model ids are unique", () => {
 	const ids = bank.models.map((m) => m.id);
 	assert.equal(new Set(ids).size, ids.length);
+});
+
+// ------------------------------------------------- default model discovery
+
+console.log("模型默认值跟随 profile 配置");
+
+await test("the source ships no vendor id as a default", () => {
+	// The defect this pins: `provider: "a1"` was baked into DEFAULTS, so on any
+	// profile that does not define a1 the panel either 500s on
+	// `listModels("a1")` or preselects models the user never configured.
+	assert.equal(DEFAULTS.provider, "", "a hard-coded provider breaks every other profile");
+	assert.equal(DEFAULTS.modelPattern, "", "a hard-coded pattern preselects unconfigured models");
+	assert.deepEqual(DEFAULTS.languages, [], "the default must be every language");
+});
+
+await test("no configured provider means every provider the profile has", async () => {
+	const targets = await resolveTargets(
+		{
+			llm: {
+				listProviders: () => [{ id: "aiinput" }, { id: "other" }],
+				listModels: async (p) => (p === "aiinput" ? [{ id: "deepseek-v4.1-flash" }] : [{ id: "m3" }])
+			}
+		},
+		{ provider: "", modelPattern: "" }
+	);
+	assert.deepEqual(targets, [
+		{ provider: "aiinput", model: "deepseek-v4.1-flash" },
+		{ provider: "other", model: "m3" }
+	]);
+});
+
+await test("one unreachable provider does not blank the others", async () => {
+	const targets = await resolveTargets(
+		{
+			llm: {
+				listProviders: () => [{ id: "down" }, { id: "up" }],
+				listModels: async (p) => {
+					if (p === "down") throw new Error("route down");
+					return [{ id: "ok" }];
+				}
+			}
+		},
+		{ provider: "", modelPattern: "" }
+	);
+	assert.deepEqual(targets, [{ provider: "up", model: "ok" }]);
+});
+
+await test("every configured provider failing surfaces as an error", async () => {
+	await assert.rejects(
+		() => resolveTargets(
+			{ llm: { listProviders: () => [{ id: "down" }], listModels: async () => { throw new Error("429"); } } },
+			{ provider: "", modelPattern: "" }
+		),
+		/down/
+	);
+});
+
+await test("configuredProviders de-duplicates and falls back to discovery", () => {
+	const ctx = { llm: { listProviders: () => [{ id: "a" }, { id: "a" }, { id: "b" }] } };
+	assert.deepEqual(configuredProviders(ctx, {}), ["a", "b"]);
+	assert.deepEqual(configuredProviders(ctx, { provider: "only" }), ["only"]);
+	assert.deepEqual(configuredProviders(ctx, { provider: "  " }), ["a", "b"]);
+});
+
+// ------------------------------------------------- challenge languages
+
+console.log("挑战语言选择");
+
+await test("the language menu lists all five languages with labels", async () => {
+	const { routes } = mountRoutes();
+	const res = fakeResponse();
+	await routes.get(`${ROUTE_PREFIX}/models`).handler(fakeRequest("GET"), res);
+	const payload = JSON.parse(res.record.body);
+	assert.deepEqual(payload.languages.map((l) => l.id), ["zh", "en", "ja", "ko", "fr"]);
+	for (const language of payload.languages) {
+		assert.ok(typeof language.label === "string" && language.label.length > 0, `label for ${language.id}`);
+	}
+	// All five are preselected, which preserves the historical behaviour.
+	assert.deepEqual(payload.defaultLanguages, ["zh", "en", "ja", "ko", "fr"]);
+});
+
+await test("an absent language field means every language", () => {
+	assert.deepEqual(resolveLanguages(undefined), []);
+	assert.deepEqual(resolveLanguages(["zh"]), ["zh"]);
+	// Order is canonical, not request order, so the manifest is stable.
+	assert.deepEqual(resolveLanguages(["fr", "zh"]), ["zh", "fr"]);
+});
+
+await test("unknown language ids are dropped", () => {
+	assert.deepEqual(resolveLanguages(["klingon"]), []);
+	assert.deepEqual(resolveLanguages(["zh", "klingon"]), ["zh"]);
+});
+
+await test("the body is read once and yields both selections", async () => {
+	const body = await readRequest(fakeRequest("POST", { models: ["a1/m"], languages: ["ja"] }));
+	assert.deepEqual(selectionFrom(body), ["a1/m"]);
+	assert.deepEqual(languagesFrom(body), ["ja"]);
+});
+
+await test("an explicitly empty language selection is not upgraded to everything", async () => {
+	const body = await readRequest(fakeRequest("POST", { models: ["a1/m"], languages: [] }));
+	assert.deepEqual(languagesFrom(body), [], "[] must stay empty so the route can reject it");
+	assert.equal(languagesFrom({}), undefined);
+});
+
+await test("an empty language selection is refused instead of drawing from all five", async () => {
+	const { routes } = mountRoutes();
+	const res = fakeResponse();
+	await routes.get(`${ROUTE_PREFIX}/run`).handler(fakeRequest("POST", { models: ["a1/m"], languages: [] }), res);
+	assert.equal(res.record.statusCode, 400);
+	assert.match(JSON.parse(res.record.body).error, /语言/);
+});
+
+await test("a POST records the language selection in the manifest", async () => {
+	const { routes } = mountRoutes();
+	const res = fakeResponse();
+	await routes.get(`${ROUTE_PREFIX}/run`).handler(fakeRequest("POST", { models: ["a1/m"], languages: ["zh"] }), res);
+	assert.equal(res.record.statusCode, 202);
+	assert.deepEqual(JSON.parse(res.record.body).languages, ["zh"]);
+});
+
+await test("a RESTRICTED language selection is never drawn from another language", () => {
+	// The point of the picker: tick Chinese and every challenge must be worded
+	// in Chinese. A single leak here answers a different question than the one
+	// the user asked, and nothing downstream could detect it.
+	for (let i = 0; i < 40; i += 1) {
+		const [challenge] = generateChallenges(1, [], ["zh"]);
+		assert.equal(challenge.language, "zh");
+		assert.ok(/[\u4e00-\u9fff]/.test(challenge.prompt), "a zh challenge must be worded in Chinese");
+	}
+});
+
+await test("a restricted pool reports the language it actually used", () => {
+	const challenges = generateChallenges(3, [], ["en", "fr"]);
+	assert.equal(challenges.length, 3);
+	for (const challenge of challenges) {
+		assert.ok(["en", "fr"].includes(challenge.language), `unexpected language ${challenge.language}`);
+	}
+});
+
+await test("an empty or unknown language list falls back to every language", () => {
+	// Fallback, not an empty pool: choosing no template would crash the draw.
+	for (const selection of [[], ["klingon"], undefined]) {
+		const [challenge] = generateChallenges(1, [], selection);
+		assert.ok(["zh", "en", "ja", "ko", "fr"].includes(challenge.language));
+	}
 });
 
 // ---------------------------------------------------------------- summary

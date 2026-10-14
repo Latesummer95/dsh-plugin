@@ -12,16 +12,21 @@
 # halves, and each half's own slice overrides the shared value:
 #
 #   config:
-#     provider: a1            # shared
+#     provider: ""            # shared; empty = every configured provider
 #     concurrency: 1          # shared
 #     coding:
-#       modelPattern: gpt-6
-#       reasoningEffort: high
+#       modelPattern: ""      # empty = no filter
+#       reasoningEffort: null # null omits the field
 #       complexTrials: 3
 #     fingerprint:
-#       modelPattern: deepseek-v4.1-flash
-#       reasoningEffort: null   # this route rejects the level; sending it fails
+#       languages: [zh, en]   # empty = all five
+#       reasoningEffort: null
 #       spacingMs: 1500
+#
+# No provider id is named here on purpose. These defaults ship to every profile,
+# and a route id that only exists on the author's machine is either a hard
+# failure (`listModels` on an unknown provider) or a silent preselection of
+# models the user never configured. Empty means "read what this profile has".
 - insert:
     # The halves stay loader entries: each owns its own routes and its own client
     # bundle, and `dsh-probe/client.js` requires them by name. They no longer add
@@ -33,13 +38,15 @@
     - id: probe
       name: './index.js'
       config:
-        provider: a1
         concurrency: 1
         coding:
-          modelPattern: gpt-6
-          reasoningEffort: high
+          provider: ""
+          # `null` omits the field. Sending an effort the route does not accept
+          # fails every probe, which looks like a degraded model rather than a
+          # misconfiguration — so the shipped default is to omit it.
+          reasoningEffort: null
           complexTrials: 3
         fingerprint:
-          modelPattern: deepseek-v4.1-flash
+          provider: ""
           reasoningEffort: null
           spacingMs: 1500

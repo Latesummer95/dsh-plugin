@@ -1333,14 +1333,23 @@ function apply(ctx, config = {}) {
 				const catalog = await listCandidates(ctx);
 				// What the profile would probe with no explicit selection. If
 				// route discovery finds nothing, fall back to the catalog the
-				// panel can already see rather than leaving the picker empty.
+				// panel can already see — but only when the config asked for no
+				// restriction at all. A pattern that matches nothing is a
+				// deliberate narrowing whose empty result is the answer;
+				// silently preselecting something else would hide a stale
+				// config behind a plausible-looking run.
 				let defaults = [];
 				try {
 					defaults = (await resolveTargets(ctx, cfg)).map((t) => `${t.provider}/${t.model}`);
 				} catch {
 					defaults = [];
 				}
-				if (defaults.length === 0) defaults = catalog.models.map((m) => `${m.provider}/${m.model}`);
+				const restricted = String(cfg.provider ?? "").trim().length > 0
+					|| String(cfg.modelPattern ?? "").trim().length > 0
+					|| (Array.isArray(cfg.models) && cfg.models.length > 0);
+				if (defaults.length === 0 && !restricted) {
+					defaults = catalog.models.map((m) => `${m.provider}/${m.model}`);
+				}
 				sendJson(res, 200, {
 					provider: cfg.provider,
 					modelPattern: cfg.modelPattern,
