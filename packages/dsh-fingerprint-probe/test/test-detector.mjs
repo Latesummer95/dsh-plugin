@@ -28,9 +28,11 @@ import { fileURLToPath } from "node:url";
 
 import {
 	DEFAULTS,
+	MAX_CONCURRENCY,
 	ROUTE_PREFIX,
 	UPSTREAM,
 	apply,
+	concurrencyWidth,
 	configuredProviders,
 	inject,
 	languagesFrom,
@@ -41,6 +43,7 @@ import {
 	readSelection,
 	resolveLanguages,
 	resolveTargets,
+	runPool,
 	selectionFrom
 } from "../index.js";
 import { generateChallenges } from "../lib/challenge.js";
@@ -1068,6 +1071,118 @@ await test("an empty or unknown language list falls back to every language", () 
 		const [challenge] = generateChallenges(1, [], selection);
 		assert.ok(["zh", "en", "ja", "ko", "fr"].includes(challenge.language));
 	}
+});
+
+// ---------------------------------------------------------------- concurrency
+
+console.log("并发（concurrency 曾经是个假旋钮）");
+
+await test("the concurrency knob is honoured, not decorative", async () => {
+	// The defect this pins: `concurrency` was declared in DEFAULTS and
+	// documented in the README, but `runDetection` was a plain `for...of` loop
+	// that never read it. Setting it to 2 changed nothing at all.
+	let inFlight = 0;
+	let peak = 0;
+	const done = [];
+	await runPool([1, 2, 3, 4], 2, async (item) => {
+		inFlight += 1;
+		peak = Math.max(peak, inFlight);
+		await new Promise((r) => setTimeout(r, 10));
+		inFlight -= 1;
+		done.push(item);
+	});
+	assert.equal(peak, 2, `expected at most 2 in flight, saw ${peak}`);
+	assert.deepEqual([...done].sort(), [1, 2, 3, 4], "every item must be processed exactly once");
+});
+
+await test("the default stays strictly serial", async () => {
+	// Widening the default would change the request pattern every existing
+	// profile gets, and the gateway's throttling is why it was serial.
+	let inFlight = 0;
+	let peak = 0;
+	await runPool([1, 2, 3], 1, async () => {
+		inFlight += 1;
+		peak = Math.max(peak, inFlight);
+		await new Promise((r) => setTimeout(r, 5));
+		inFlight -= 1;
+	});
+	assert.equal(peak, 1);
+});
+
+await test("a serial run keeps target order", async () => {
+	// With one lane the report's order is the target order, which is what every
+	// existing profile sees and what the panel's cards are laid out by.
+	const serial = [];
+	await runPool(["a", "b", "c"], 1, async (item) => {
+		await new Promise((r) => setTimeout(r, 1));
+		serial.push(item);
+	});
+	assert.deepEqual(serial, ["a", "b", "c"]);
+});
+
+await test("two lanes finish a multi-model round in about half the time", async () => {
+	// The whole point of honouring the knob. Four equal items: the bound is
+	// generous because a loaded machine can stretch either measurement.
+	const items = [40, 40, 40, 40];
+	const time = async (width) => {
+		const started = Date.now();
+		await runPool(items, width, async () => { await new Promise((r) => setTimeout(r, 40)); });
+		return Date.now() - started;
+	};
+	const serial = await time(1);
+	const parallel = await time(2);
+	assert.ok(serial >= 140, `a serial round of 4x40ms should take ~160ms, took ${serial}`);
+	assert.ok(parallel < serial * 0.7, `two lanes should roughly halve it: ${serial}ms -> ${parallel}ms`);
+});
+
+await test("remaining counts down so the last item is not paced", async () => {
+	const seen = [];
+	await runPool(["a", "b", "c"], 1, async (_item, remaining) => { seen.push(remaining); });
+	assert.deepEqual(seen, [2, 1, 0]);
+});
+
+await test("the pool survives a lane whose worker catches its own error", async () => {
+	// The pool's contract: the worker owns its errors. `runDetection`'s worker
+	// catches per target, which is what stops one unreachable model from
+	// abandoning the models queued behind it.
+	const done = [];
+	await runPool([1, 2, 3, 4], 2, async (item) => {
+		try {
+			if (item === 2) throw new Error("route down");
+			await new Promise((r) => setTimeout(r, 5));
+			done.push(item);
+		} catch {
+			done.push(`caught:${item}`);
+		}
+	});
+	assert.deepEqual([...done].sort(), [1, 3, 4, "caught:2"]);
+});
+
+await test("an empty target list is a no-op", async () => {
+	let calls = 0;
+	await runPool([], 2, async () => { calls += 1; });
+	assert.equal(calls, 0);
+});
+
+await test("concurrency is clamped into the usable range", () => {
+	assert.equal(concurrencyWidth(undefined), 1, "unset means one at a time");
+	assert.equal(concurrencyWidth(0), 1);
+	assert.equal(concurrencyWidth(-4), 1);
+	assert.equal(concurrencyWidth("nonsense"), 1);
+	assert.equal(concurrencyWidth(1), 1);
+	assert.equal(concurrencyWidth(2), 2);
+	assert.equal(concurrencyWidth(99), MAX_CONCURRENCY, "a higher bound mostly buys 429s");
+});
+
+await test("the manifest reports the effective concurrency, not the requested one", async () => {
+	const { routes } = mountRoutes({}, { provider: "a1", modelPattern: "gpt-6", concurrency: 8 });
+	const res = fakeResponse();
+	await routes.get(`${ROUTE_PREFIX}/run`).handler(fakeRequest("POST", { models: ["a1/m"] }), res);
+	assert.equal(JSON.parse(res.record.body).concurrency, MAX_CONCURRENCY);
+});
+
+await test("the default config still runs models one at a time", () => {
+	assert.equal(concurrencyWidth(DEFAULTS.concurrency), 1);
 });
 
 // ---------------------------------------------------------------- summary

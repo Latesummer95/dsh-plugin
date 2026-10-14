@@ -87,7 +87,7 @@ const DEFAULTS = {
 	maxTokens: 8000,
 	/** Per-request wall clock budget. Generation is a single long completion. */
 	timeoutMs: 180000,
-	/** Models to probe concurrently. Gateways throttle hard, so one at a time. */
+	/** Models to probe concurrently, 1–{@link MAX_CONCURRENCY}. Gateways throttle hard, so the default is one at a time. */
 	concurrency: 1,
 	/** Pause between models in milliseconds. */
 	spacingMs: 1500,
@@ -528,7 +528,67 @@ async function probeModel(ctx, target, reference, config, onProgress) {
 }
 
 /**
+ * Upper bound on how many models may be probed at once.
+ *
+ * Gateways here throttle hard, and a higher bound mostly buys 429s — which the
+ * panel reports honestly as "refused, never reached the model" rather than as a
+ * failure, but which still costs the round its samples. The sibling coding probe
+ * uses the same bound; keeping them equal means one config value means the same
+ * thing in both halves of the merged panel.
+ */
+const MAX_CONCURRENCY = 2;
+
+/**
+ * Clamp a configured concurrency into the usable range.
+ *
+ * A missing, zero, negative, or non-numeric value means "one at a time", which
+ * is what the plugin did unconditionally before this was honoured.
+ *
+ * @param value - the configured `concurrency`.
+ * @returns an integer in `[1, MAX_CONCURRENCY]`.
+ */
+function concurrencyWidth(value) {
+	return Math.max(1, Math.min(Number(value) || 1, MAX_CONCURRENCY));
+}
+
+/**
+ * Run `worker` over `items` with at most `width` in flight.
+ *
+ * The worker owns its own error handling: one lane that throws would otherwise
+ * abandon the items still queued behind it. `runDetection`'s worker catches per
+ * target for exactly that reason.
+ *
+ * @param items - the work items.
+ * @param width - maximum lanes.
+ * @param worker - `async (item, remaining) => void`, where `remaining` is how
+ *   many items are still queued (0 for the last one drawn).
+ * @returns a promise that settles when every item has been handed out.
+ */
+async function runPool(items, width, worker) {
+	const queue = [...items];
+	const lanes = Math.max(1, Math.min(width, queue.length));
+	const run = async () => {
+		for (;;) {
+			const item = queue.shift();
+			if (item === undefined) return;
+			await worker(item, queue.length);
+		}
+	};
+	await Promise.all(Array.from({ length: lanes }, run));
+}
+
+/**
  * Run a detection over the resolved targets.
+ *
+ * Models run `config.concurrency` at a time (default 1, i.e. the serial
+ * behaviour this always had). Concurrency is the only lever here that shortens
+ * a multi-model round without changing what is measured: each model still gets
+ * its full three challenges, and a throttled request is still counted as
+ * refused rather than as a failure.
+ *
+ * With `concurrency > 1` the report's model order is completion order, not
+ * target order — the array is the live partial result a polling panel reads,
+ * so a finished model has to appear the moment it finishes.
  *
  * @param ctx - the plugin context.
  * @param targets - the `{provider, model}` pairs to probe.
@@ -541,7 +601,11 @@ async function probeModel(ctx, target, reference, config, onProgress) {
 async function runDetection(ctx, targets, config, onProgress, report) {
 	const reference = await loadReference({ onProgress });
 	const models = report?.models ?? [];
-	for (const [index, target] of targets.entries()) {
+	const width = concurrencyWidth(config.concurrency);
+	// The index travels with the target rather than being recovered by
+	// `indexOf`, which would report the same position twice for a duplicated
+	// `provider/model`.
+	await runPool(targets.map((target, index) => ({ target, index })), width, async ({ target, index }, remaining) => {
 		onProgress?.(`[${index + 1}/${targets.length}] ${target.provider}/${target.model}`);
 		try {
 			models.push(await probeModel(ctx, target, reference, config, onProgress));
@@ -550,14 +614,16 @@ async function runDetection(ctx, targets, config, onProgress, report) {
 				provider: target.provider,
 				model: target.model,
 				accepted: 0,
-				total: 3,
+				total: REQUIRED_OUTPUTS,
 				attempts: [],
 				analysis: null,
 				error: error instanceof Error ? error.message : String(error)
 			});
 		}
-		if (index < targets.length - 1 && config.spacingMs > 0) await new Promise((r) => setTimeout(r, config.spacingMs));
-	}
+		// Only pace when something is still queued: waiting after the last item
+		// of a round is pure latency.
+		if (remaining > 0 && config.spacingMs > 0) await new Promise((r) => setTimeout(r, config.spacingMs));
+	});
 	return models;
 }
 
@@ -700,6 +766,10 @@ function apply(ctx, config = {}) {
 						modelPattern: cfg.modelPattern ?? null,
 						reasoningEffort: cfg.reasoningEffort,
 						timeoutMs: cfg.timeoutMs,
+						// The effective value, not the configured one: the knob is
+						// clamped, and a panel that echoed 8 back would explain
+						// nothing about why the round ran two at a time.
+						concurrency: concurrencyWidth(cfg.concurrency),
 						upstream: UPSTREAM,
 						cache: cacheStatus(),
 						languages: languages.length > 0 ? languages : [...LANGUAGE_IDS],
@@ -827,10 +897,12 @@ function apply(ctx, config = {}) {
 
 export {
 	DEFAULTS,
+	MAX_CONCURRENCY,
 	ROUTE_PREFIX,
 	UPSTREAM,
 	apply,
 	cacheStatus,
+	concurrencyWidth,
 	configuredProviders,
 	describeLanguages,
 	elicit,
@@ -848,5 +920,6 @@ export {
 	resolveLanguages,
 	resolveTargets,
 	runDetection,
+	runPool,
 	selectionFrom
 };
