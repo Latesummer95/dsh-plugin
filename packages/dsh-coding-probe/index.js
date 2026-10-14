@@ -225,12 +225,30 @@ const PROBES = [
 
 /** Conservative defaults; every field is overridable from the profile patch. */
 const DEFAULTS = {
-	/** Provider route to probe. */
-	provider: "a1",
-	/** Substring filter selecting which of that provider's models to probe. */
-	modelPattern: "gpt-6",
+	/**
+	 * Provider route to probe; empty means every provider the profile has
+	 * configured.
+	 *
+	 * Deliberately *not* a vendor id baked into the source: this plugin is
+	 * installed into any profile, and a hard-coded route either fails outright
+	 * (`listModels` on an unknown provider) or silently preselects models the
+	 * user never configured. Empty is the honest default — the profile is the
+	 * source of truth — and a non-empty value narrows the selection.
+	 */
+	provider: "",
+	/** Substring filter applied to the configured models; empty means no filter. */
+	modelPattern: "",
 	/** Explicit `provider/model` list; overrides provider + modelPattern when set. */
 	models: [],
+	/**
+	 * Probe ids to run; empty means every probe in {@link PROBES}.
+	 *
+	 * A full battery is expensive (the complex brief runs
+	 * {@link DEFAULTS.complexTrials} times per model), so the panel lets the
+	 * user run only the part they care about instead of always paying for all
+	 * of it.
+	 */
+	probes: [],
 	/** Reasoning effort forwarded to the route; `null` omits the field entirely. */
 	reasoningEffort: "high",
 	/** Max output tokens per probe. The complex brief needs room. */
@@ -641,8 +659,14 @@ function parseSelection(entries, fallbackProvider) {
  *     route). This is the normal path: the panel always sends an explicit list,
  *     so the probe never silently grades a different set than the user chose.
  *  2. `config.models` — an explicit list pinned in the profile patch.
- *  3. `config.provider` + `config.modelPattern` — the legacy substring filter,
- *     kept as the fallback for scripted/headless use.
+ *  3. The profile's own configured routes: `config.provider` when set, otherwise
+ *     every provider `llm` reports, optionally narrowed by `config.modelPattern`.
+ *
+ * The third step is what keeps this plugin free of a baked-in vendor id. It
+ * reads the same catalog `llm` already built from the profile, so the panel's
+ * default selection is "what this machine is actually configured with" — which
+ * is the only answer that is correct on every profile the plugin is installed
+ * into.
  *
  * @param ctx - the plugin context.
  * @param config - the resolved plugin config.
@@ -656,10 +680,75 @@ async function resolveTargets(ctx, config, requested) {
 	if (Array.isArray(config.models) && config.models.length > 0) {
 		return parseSelection(config.models, config.provider);
 	}
-	const models = await ctx.llm.listModels(config.provider);
 	const pattern = String(config.modelPattern ?? "");
-	const filtered = pattern.length === 0 ? models : models.filter((m) => String(m.id).includes(pattern));
-	return filtered.map((m) => ({ provider: config.provider, model: m.id }));
+	const targets = [];
+	const failed = [];
+	for (const provider of configuredProviders(ctx, config)) {
+		try {
+			for (const model of await ctx.llm.listModels(provider)) {
+				const id = String(model?.id ?? "");
+				if (id.length === 0) continue;
+				if (pattern.length > 0 && !id.includes(pattern)) continue;
+				targets.push({ provider, model: id });
+			}
+		} catch (error) {
+			// One unreachable route must not blank the default selection, but a
+			// total failure has to surface: an empty list would otherwise read
+			// as "you configured no models".
+			failed.push(`${provider}（${error instanceof Error ? error.message : String(error)}）`);
+		}
+	}
+	if (targets.length === 0 && failed.length > 0) {
+		throw new Error(`无法读取已配置的模型：${failed.join("；")}`);
+	}
+	return targets;
+}
+
+/**
+ * The provider routes the profile has configured.
+ *
+ * An explicit `config.provider` wins; otherwise this is whatever `llm` reports
+ * as configured, so the plugin never names a vendor that the profile may not
+ * even define.
+ *
+ * @param ctx - the plugin context.
+ * @param config - the resolved plugin config.
+ * @returns provider ids, possibly empty when nothing is configured.
+ */
+function configuredProviders(ctx, config) {
+	const explicit = String(config?.provider ?? "").trim();
+	if (explicit.length > 0) return [explicit];
+	const listed = ctx.llm?.listProviders?.() ?? [];
+	const ids = listed
+		.map((p) => String(p?.id ?? p?.provider ?? p?.name ?? ""))
+		.filter((id) => id.length > 0);
+	return Array.from(new Set(ids));
+}
+
+/**
+ * The probes a run should execute.
+ *
+ * An absent selection means the whole battery; an explicit selection is
+ * filtered to known ids in {@link PROBES} order, so a stale client cannot make
+ * a run report results for a probe that does not exist.
+ *
+ * @param ids - requested probe ids, or `undefined` for "all".
+ * @returns the probes to run, in battery order.
+ */
+function resolveProbes(ids) {
+	if (!Array.isArray(ids)) return [...PROBES];
+	const wanted = new Set(ids.map((id) => String(id).trim()));
+	return PROBES.filter((probe) => wanted.has(probe.id));
+}
+
+/**
+ * Describe probes for the panel, without shipping their prompts or graders.
+ *
+ * @param probes - probes to describe.
+ * @returns serialisable descriptors.
+ */
+function describeProbes(probes) {
+	return probes.map((p) => ({ id: p.id, label: p.label, tier: p.tier, kind: p.kind, about: p.about }));
 }
 
 /**
@@ -715,24 +804,67 @@ async function readBody(req) {
 }
 
 /**
+ * Read and parse a POST body once.
+ *
+ * The request stream can only be consumed a single time, so both the model and
+ * the probe selection have to come out of this one read — reading the body
+ * twice would silently lose whichever field came second.
+ *
+ * @param req - the incoming request.
+ * @returns the parsed object, or `{}` when the body is absent, oversized, or
+ *   not a JSON object.
+ */
+async function readRequest(req) {
+	const text = await readBody(req);
+	if (text.trim().length === 0) return {};
+	try {
+		const body = JSON.parse(text);
+		return body !== null && typeof body === "object" && !Array.isArray(body) ? body : {};
+	} catch {
+		return {};
+	}
+}
+
+/**
+ * Read the requested model selection out of a parsed body.
+ *
+ * @param body - the parsed POST body.
+ * @returns the selection, or `undefined` to fall back to the configured targets.
+ */
+function selectionFrom(body) {
+	const raw = body?.models ?? body?.targets;
+	if (!Array.isArray(raw)) return undefined;
+	const cleaned = raw.map((m) => String(m).trim()).filter((m) => m.length > 0);
+	return cleaned.length > 0 ? cleaned : undefined;
+}
+
+/**
+ * Read the requested probe selection out of a parsed body.
+ *
+ * Absent means "the whole battery" (an older client, or a scripted run). A
+ * present-but-empty selection is reported as an empty array rather than
+ * silently upgraded to every probe: the route turns that into a 400, because
+ * running the full battery when the user asked for none would be the expensive
+ * version of ignoring them.
+ *
+ * @param body - the parsed POST body.
+ * @returns the requested probe ids, or `undefined` when the field is absent.
+ */
+function probesFrom(body) {
+	const raw = body?.probes;
+	if (!Array.isArray(raw)) return undefined;
+	const known = new Set(PROBES.map((p) => p.id));
+	return raw.map((p) => String(p).trim()).filter((id) => known.has(id));
+}
+
+/**
  * Read the requested model selection from a POST body.
  *
  * @param req - the incoming request.
  * @returns the selection, or `undefined` to fall back to the configured targets.
  */
 async function readSelection(req) {
-	const text = await readBody(req);
-	if (text.trim().length === 0) return undefined;
-	let body;
-	try {
-		body = JSON.parse(text);
-	} catch {
-		return undefined;
-	}
-	const raw = body?.models ?? body?.targets;
-	if (!Array.isArray(raw)) return undefined;
-	const cleaned = raw.map((m) => String(m).trim()).filter((m) => m.length > 0);
-	return cleaned.length > 0 ? cleaned : undefined;
+	return selectionFrom(await readRequest(req));
 }
 
 /**
@@ -960,6 +1092,10 @@ function score(results) {
 	else if (targetAttempts > 0 && usableAttempts === 0) verdict = "inconclusive";
 	else if (usableAttempts > 0 && targetRendered === 0) verdict = targetGenerated > 0 ? "broken-code" : "timeout-bound";
 	else if (usableAttempts > 0 && targetRendered < usableAttempts) verdict = "unstable";
+	// Only the control tier ran. Calling that "healthy" would overclaim: the
+	// controls can show that basic ability is intact, never that complex
+	// generation works — and the panel now lets the user run them alone.
+	else if (targetAttempts === 0) verdict = controlPassed > 0 ? "control-only" : "inconclusive";
 	// The controls were all refused, so the target result stands on its own.
 	else if (controlUsable === 0) verdict = targetRendered > 0 ? "healthy" : "inconclusive";
 	else verdict = "healthy";
@@ -978,12 +1114,13 @@ function score(results) {
  *
  * @param ctx - the plugin context.
  * @param targets - the routes to probe.
+ * @param probes - the probes to run, in battery order.
  * @param config - the resolved plugin config.
  * @param report - optional live report; each finished model is pushed into it
  *   as it completes so a polling reader sees partial results.
  * @returns a promise of model reports.
  */
-async function runBattery(ctx, targets, config, report) {
+async function runBattery(ctx, targets, probes, config, report) {
 	const reports = report?.models ?? [];
 	const queue = [...targets];
 	const worker = async () => {
@@ -991,7 +1128,7 @@ async function runBattery(ctx, targets, config, report) {
 			const target = queue.shift();
 			if (target === undefined) return;
 			const results = [];
-			for (const probe of PROBES) {
+			for (const probe of probes) {
 				results.push(probe.kind === "complex"
 					? await runRepeated(ctx, target, probe, config)
 					: await runSingle(ctx, target, probe, config));
@@ -1117,8 +1254,17 @@ function apply(ctx, config = {}) {
 				res.end();
 				return;
 			}
-			// POST may carry an explicit model selection; GET never does.
-			const requested = req.method === "POST" ? await readSelection(req) : undefined;
+			// POST may carry an explicit model and probe selection; GET never
+			// does. The body is read exactly once — see {@link readRequest}.
+			const body = req.method === "POST" ? await readRequest(req) : {};
+			const requested = req.method === "POST" ? selectionFrom(body) : undefined;
+			if (req.method === "POST" && Array.isArray(body.probes) && probesFrom(body).length === 0) {
+				// An explicit empty selection is a client bug, not a request to
+				// run the whole (expensive) battery.
+				sendJson(res, 400, { error: "请至少选择一项检测内容" });
+				return;
+			}
+			const probes = req.method === "POST" ? resolveProbes(probesFrom(body)) : [...PROBES];
 			let targets;
 			try {
 				targets = await resolveTargets(ctx, cfg, requested);
@@ -1132,7 +1278,7 @@ function apply(ctx, config = {}) {
 				reasoningEffort: cfg.reasoningEffort,
 				complexTrials: cfg.complexTrials,
 				timeoutMs: cfg.timeoutMs,
-				probes: PROBES.map((p) => ({ id: p.id, label: p.label, tier: p.tier, kind: p.kind, about: p.about })),
+				probes: describeProbes(probes),
 				targets: targets.map((t) => `${t.provider}/${t.model}`)
 			};
 			// GET is the inspection endpoint: it reports the current job's state,
@@ -1157,7 +1303,7 @@ function apply(ctx, config = {}) {
 			}
 			// POST starts the job and returns at once. The panel polls GET, so
 			// navigating away mid-run no longer throws the work away.
-			const { job, done } = runs.start(manifest, (live) => runBattery(ctx, targets, cfg, live));
+			const { job, done } = runs.start(manifest, (live) => runBattery(ctx, targets, probes, cfg, live));
 			// Keep the promise observed even though the response has already been
 			// sent, so a rejected battery cannot surface as an unhandled rejection.
 			done.catch(() => {});
@@ -1165,8 +1311,8 @@ function apply(ctx, config = {}) {
 		}
 	}), `coding-probe: ${ROUTE_PREFIX}/run`);
 
-	// Model catalog for the panel's picker. Kept off the run route so opening
-	// the panel never triggers a battery.
+	// Model catalog for the panel's picker, plus the probe menu. Kept off the
+	// run route so opening the panel never triggers a battery.
 	ctx.effect(() => ctx.webServer.register({
 		kind: "exact",
 		path: `${ROUTE_PREFIX}/models`,
@@ -1185,11 +1331,25 @@ function apply(ctx, config = {}) {
 			}
 			try {
 				const catalog = await listCandidates(ctx);
+				// What the profile would probe with no explicit selection. If
+				// route discovery finds nothing, fall back to the catalog the
+				// panel can already see rather than leaving the picker empty.
+				let defaults = [];
+				try {
+					defaults = (await resolveTargets(ctx, cfg)).map((t) => `${t.provider}/${t.model}`);
+				} catch {
+					defaults = [];
+				}
+				if (defaults.length === 0) defaults = catalog.models.map((m) => `${m.provider}/${m.model}`);
 				sendJson(res, 200, {
 					provider: cfg.provider,
 					modelPattern: cfg.modelPattern,
-					// What the profile would probe with no explicit selection.
-					defaults: (await resolveTargets(ctx, cfg)).map((t) => `${t.provider}/${t.model}`),
+					defaults,
+					// The probe menu needs no battery run and no model catalog,
+					// so it ships with the same payload the picker already
+					// fetches: one request populates both selectors.
+					probes: describeProbes(PROBES),
+					defaultProbes: PROBES.map((p) => p.id),
 					...catalog
 				});
 			} catch (error) {
@@ -1204,8 +1364,8 @@ function apply(ctx, config = {}) {
 		PROBES.filter((p) => p.tier === "control").length,
 		PROBES.filter((p) => p.tier === "target").length,
 		cfg.complexTrials,
-		cfg.provider,
-		cfg.modelPattern
+		cfg.provider.length > 0 ? cfg.provider : "(every configured provider)",
+		cfg.modelPattern.length > 0 ? cfg.modelPattern : "(no filter)"
 	);
 }
 
@@ -1216,6 +1376,8 @@ export {
 	ROUTE_PREFIX,
 	apply,
 	classifyFailure,
+	configuredProviders,
+	describeProbes,
 	execute,
 	extractCode,
 	generate,
@@ -1226,8 +1388,12 @@ export {
 	measureRender,
 	name,
 	parseSelection,
+	probesFrom,
+	readRequest,
 	readSelection,
+	resolveProbes,
 	resolveTargets,
 	runNode,
-	score
+	score,
+	selectionFrom
 };

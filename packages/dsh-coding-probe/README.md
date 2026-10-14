@@ -73,9 +73,33 @@
 
 1. **面板勾选的模型**（POST body 里的 `models`）——正常路径，永远以你的勾选为准
 2. `config.models`——写在 profile 里的固定清单
-3. `config.provider` + `config.modelPattern`——子串匹配，给脚本/无头调用兜底
+3. **profile 实际配置的模型**——`config.provider` 为空时逐个 provider 读，非空时只读那一个，
+   再按 `config.modelPattern`（可空）过滤
+
+第 3 条不写死任何 provider。这个插件会被装进各种 profile，而 `a1` 只是作者自己的网关路由：
+写死它的话，别的 profile 上要么 `listModels` 直接失败，要么预勾一批用户从没配过的模型。
 
 单个 provider 读取失败不会让整个列表空白，面板会把失败原因列出来，其余模型照常可选。
+只有**全部** provider 都读不到才报错——把「读不到」显示成「你没配模型」会让人去查错地方。
+
+## 选检测内容
+
+电池不是一个整体，四个探针回答两个不同的问题：
+
+| 分组 | 探针 | 回答什么 |
+|---|---|---|
+| 对照组 | 事件循环时序、WebGL 小三角形 | 基础能力还在不在 |
+| 复杂任务 | 鹈鹕骑自行车（SVG）、复杂 3D 场景（真实 brief） | 高复杂度代码生成还在不在 |
+
+面板上每一项单独可勾，按这两组排列，每项带类型标签（执行 JS / 浏览器渲染 / 复杂任务×N）和说明。
+不必为了一个问题付整套电池的代价：复杂任务每个模型要重复 `complexTrials` 次，是最贵的那部分。
+
+- **字段缺失 = 跑全部**，所以旧客户端和脚本调用仍然兼容
+- **显式传空数组返回 400**，而不是悄悄跑全量——那等于用最贵的方式无视用户
+- 探针顺序始终按电池定义顺序，不按请求顺序：对照组要先于复杂任务被读到
+
+只勾对照组时判定是 **仅对照组通过**，不会报「正常」——后者等于宣称复杂代码生成已验证，
+而它根本没跑。没运行的 tier 也不会在结果卡里显示成 `0/0`。
 
 ## 配置
 
@@ -85,13 +109,14 @@
 - id: coding-probe
   name: dsh-coding-probe
   config:
-    provider: a1
-    modelPattern: gpt-6      # 只是面板未勾选时的兜底，正常用面板选
+    provider: ""             # 空 = 用 profile 里已配置的全部 provider；模型在面板上勾
+    modelPattern: ""         # 可空；只对上面发现出来的模型做子串过滤
     reasoningEffort: high    # 设为 null 则完全不传该字段
     complexTrials: 3         # 复杂任务重复次数
     sampleDelayMs: 3000      # 渲染采样延迟
     timeoutMs: 200000        # 单次请求预算
     concurrency: 1           # 网关限流严重，建议保持 1
+    probes: []               # 空 = 全部探针；也可钉死成 ["scheduler", "pelican"]
 ```
 
 也可以直接钉死要测的模型（优先级高于 `modelPattern`）：
@@ -104,12 +129,14 @@
 
 ## HTTP 接口
 
-- `GET /coding-probe/models` — 返回可选模型清单（provider / models / defaults），面板用它渲染勾选框
+- `GET /coding-probe/models` — 返回可选模型清单和探针菜单（provider / models / defaults /
+  probes / defaultProbes），面板用它渲染两个勾选区
 - `GET /coding-probe/run` — 返回**当前那次检测的状态**，立即返回：
   `{phase: "idle"}`（还没跑过）、`{phase: "running", id, models: [...]}`（跑着，`models` 是已完成的部分结果）、
   或 `{phase: "done"|"error", models: [...]}`
 - `POST /coding-probe/run` — **启动**电池并立即返回 `202 {phase:"running", id}`；
-  body 可带 `{"models":["a1/gpt-6-astra", ...]}` 指定要测的模型，不带则用 profile 里配置的那批
+  body 可带 `{"models":["a1/gpt-6-astra", ...], "probes":["scheduler","pelican"]}` 指定要测的模型和探针，
+  两个字段都不带则用 profile 里配置的那批 + 全部探针；`probes` 显式传空数组返回 `400`
 
 三个方法都经过宿主自身的来源校验（`connection.requestRejection`）。
 
@@ -127,10 +154,11 @@
 ## 测试
 
 ```bash
-node test/test-probe.mjs
+node test/test-probe.mjs    # 84 项
+node test/test-client.mjs   # 11 项
 ```
 
-63 项断言，含**标定测试**：把已知正确和已知错误的程序喂给真实判分逻辑，确认它既能让正确的通过，
+`test-probe.mjs` 含**标定测试**：把已知正确和已知错误的程序喂给真实判分逻辑，确认它既能让正确的通过，
 也能让错误的失败。没有这组测试，一个「什么都判通过」的判分器看起来和健康结果一模一样。
 标定用例包括：
 
@@ -138,11 +166,15 @@ node test/test-probe.mjs
 - off-by-one 的 DP 程序、把微任务写成宏任务 → 失败
 - 正确的 WebGL1 三角形 → 通过
 - **在 WebGL1 context 上调用 WebGL2 的 `createVertexArray`** → 失败（这就是捕获到的真实退化）
-- **不抛异常但什么都没画的画布** → 失败（这条最关键）
+- **不抛异常但什么都没画的 canvas** → 失败（这条最关键）
 
 还有一组针对后台运行的回归测试：`POST` 必须在电池跑完前就返回、`GET` 必须报告在跑的任务、
 第二次 `POST` 必须顶掉第一次。测试用「永不 resolve 的 stream」来保证这一点——
 如果处理函数偷偷 await 了电池，测试会直接挂住而不是假装通过。
+
+`test-client.mjs` 在桩 module loader 下装载**真实的客户端 bundle**，遍历选择器生成
+的元素树：勾选状态是否来自调用方的集合、每个勾选框的 `onChange` 是否上报自己的探针 id、
+分组与计数是否正确。客户端的勾选逻辑因此不需要浏览器也能回归。
 
 浏览器类标定需要本机有 headless Chrome，没有则自动跳过。
 

@@ -21,6 +21,6 @@
     }
   },
   "scripts": {
-    "test": "node test/test-probe.mjs"
+    "test": "node test/test-probe.mjs && node test/test-client.mjs"
   }
 }

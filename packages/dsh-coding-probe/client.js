@@ -44,6 +44,10 @@ window.__ModuleLoader__.load({
 			"broken-code": { tone: "#f85149", label: "复杂代码生成退化", note: "简单任务能过，但复杂任务生成出来的代码跑不起来或渲染不出内容。这正是降智的特征。" },
 			"timeout-bound": { tone: "#f85149", label: "复杂任务全部失败", note: "简单任务能过，但复杂任务每次都生成失败（网关超时/中断），从未产出可用结果。" },
 			degraded: { tone: "#db8b0b", label: "基础能力退化", note: "连对照组（基础 WebGL、事件循环）都失败，能力整体下降。" },
+			// Only the control tier ran, so nothing was learned about complex
+			// generation. Saying 正常 here would be the overclaim the split
+			// exists to prevent.
+			"control-only": { tone: "#8b949e", label: "仅对照组通过", note: "只跑了对照组，基础能力正常，但没有验证复杂代码生成。勾选复杂任务才能判定降智。" },
 			inconclusive: { tone: "#8b949e", label: "无法判定", note: "复杂任务的请求都被网关拒绝（限流/5xx），根本没到达模型。这不是能力证据——等网关恢复后重测。" },
 			unreachable: { tone: "#8b949e", label: "不可达", note: "全部请求失败，无法评估。" }
 		};
@@ -79,6 +83,8 @@ window.__ModuleLoader__.load({
 		const panelState = {
 			/** Ticked `provider/model` ids, or `null` until the catalog loads. */
 			selected: null,
+			/** Ticked probe ids, or `null` until the probe menu loads. */
+			selectedProbes: null,
 			/** `idle` | `running` | `done` | `error`. */
 			phase: "idle",
 			/** The last report returned by the host, or `null`. */
@@ -126,7 +132,14 @@ window.__ModuleLoader__.load({
 			grid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))", gap: "6px 14px" },
 			modelItem: { display: "flex", alignItems: "center", gap: "7px", fontSize: "12px", cursor: "pointer", minWidth: 0 },
 			modelName: { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
-			linkBtn: { background: "none", border: "none", padding: 0, color: "inherit", opacity: 0.7, cursor: "pointer", fontSize: "12px", textDecoration: "underline" }
+			linkBtn: { background: "none", border: "none", padding: 0, color: "inherit", opacity: 0.7, cursor: "pointer", fontSize: "12px", textDecoration: "underline" },
+			probeList: { display: "flex", flexDirection: "column", gap: "7px" },
+			probeItem: { display: "flex", alignItems: "flex-start", gap: "8px", fontSize: "12px", cursor: "pointer", minWidth: 0 },
+			probeText: { display: "flex", flexDirection: "column", gap: "1px", minWidth: 0 },
+			probeLabel: { fontWeight: 600 },
+			probeAbout: { opacity: 0.58, fontSize: "11px", lineHeight: 1.5 },
+			tierLabel: { fontSize: "11px", opacity: 0.6, marginTop: "2px" },
+			kindTag: { fontSize: "10px", opacity: 0.6, border: "1px solid rgba(127,127,127,.3)", borderRadius: "4px", padding: "0 5px", whiteSpace: "nowrap" }
 		};
 
 		/**
@@ -185,10 +198,14 @@ window.__ModuleLoader__.load({
 		function ModelCard({ model }) {
 			const verdict = VERDICTS[model.score?.verdict] ?? VERDICTS.unreachable;
 			const s = model.score ?? {};
+			// A tier that was not selected has no result, and "复杂任务 0/0" reads
+			// as a failure rather than as "not run". Omit it instead.
 			const tiers = React.createElement("div", { style: styles.tiers },
-				React.createElement("span", null, `对照组 ${s.control?.passed ?? 0}/${s.control?.total ?? 0}`),
-				React.createElement("span", null, `复杂任务 ${s.target?.passed ?? 0}/${s.target?.total ?? 0}`),
-				(s.target?.generated ?? 0) < (s.target?.total ?? 0) &&
+				(s.control?.total ?? 0) > 0 &&
+					React.createElement("span", null, `对照组 ${s.control?.passed ?? 0}/${s.control?.total ?? 0}`),
+				(s.target?.total ?? 0) > 0 &&
+					React.createElement("span", null, `复杂任务 ${s.target?.passed ?? 0}/${s.target?.total ?? 0}`),
+				(s.target?.total ?? 0) > 0 && (s.target?.generated ?? 0) < (s.target?.total ?? 0) &&
 					React.createElement("span", { style: styles.muted }, `其中生成成功 ${s.target?.generated ?? 0} 次`),
 				// Refused attempts never reached the model. Showing them separately
 				// stops a rate-limited run from reading as a failed one.
@@ -275,6 +292,67 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * The probe picker.
+		 *
+		 * The battery is not one thing: two cheap control probes answer "is basic
+		 * ability intact", and the complex targets answer "does high-complexity
+		 * generation still hold". Running all four when the user only wants one
+		 * answer is minutes of gateway time per model, so each probe is
+		 * individually tickable and grouped by the question it answers.
+		 *
+		 * @param props - probe menu, current selection, and change handlers.
+		 * @returns the picker element.
+		 */
+		function ProbePicker({ probes, selected, onToggle, onSelectAll, onSelectNone, loading }) {
+			const list = probes ?? [];
+			const groups = [
+				{ tier: "control", title: "对照组 · 便宜，用来判断能力是不是整体塌了" },
+				{ tier: "target", title: "复杂任务 · 真正要测的，耗时最长" }
+			];
+			const allSelected = list.length > 0 && list.every((p) => selected.has(p.id));
+			return React.createElement("section", { style: styles.picker },
+				React.createElement("div", { style: styles.pickerHead },
+					React.createElement("span", { style: styles.pickerTitle },
+						loading ? "正在读取检测项…" : `选择检测内容（已选 ${list.filter((p) => selected.has(p.id)).length} / ${list.length}）`
+					),
+					React.createElement("span", { style: { display: "flex", gap: "12px", alignItems: "center" } },
+						React.createElement("button", {
+							type: "button", style: styles.linkBtn,
+							onClick: () => (allSelected ? onSelectNone() : onSelectAll()),
+							disabled: loading || list.length === 0
+						}, allSelected ? "全不选" : "全选")
+					)
+				),
+				React.createElement("div", { style: styles.probeList },
+					groups.map((group) => {
+						const items = list.filter((p) => p.tier === group.tier);
+						if (items.length === 0) return null;
+						return React.createElement("div", { key: group.tier, style: { display: "flex", flexDirection: "column", gap: "6px" } },
+							React.createElement("div", { style: styles.tierLabel }, group.title),
+							items.map((probe) => React.createElement("label", {
+								key: probe.id, style: styles.probeItem, title: probe.about ?? ""
+							},
+								React.createElement("input", {
+									type: "checkbox",
+									checked: selected.has(probe.id),
+									onChange: () => onToggle(probe.id),
+									style: { marginTop: "2px" }
+								}),
+								React.createElement("span", { style: styles.probeText },
+									React.createElement("span", { style: { display: "flex", alignItems: "center", gap: "7px" } },
+										React.createElement("span", { style: styles.probeLabel }, probe.label),
+										React.createElement("span", { style: styles.kindTag }, KINDS[probe.kind] ?? probe.kind)
+									),
+									probe.about !== undefined && React.createElement("span", { style: styles.probeAbout }, probe.about)
+								)
+							))
+						);
+					})
+				)
+			);
+		}
+
+		/**
 		 * The probe panel.
 		 *
 		 * @returns the panel element.
@@ -292,6 +370,7 @@ window.__ModuleLoader__.load({
 			const [catalogError, setCatalogError] = React.useState(null);
 			const [loadingModels, setLoadingModels] = React.useState(true);
 			const selected = panelState.selected ?? new Set();
+			const selectedProbes = panelState.selectedProbes ?? new Set();
 
 			const loadModels = React.useCallback(async () => {
 				setLoadingModels(true);
@@ -301,12 +380,18 @@ window.__ModuleLoader__.load({
 					const payload = await response.json();
 					if (!response.ok) throw new Error(payload?.error ?? `HTTP ${response.status}`);
 					setCatalog(payload);
-					// Preselect the profile's configured targets, but never
-					// overwrite a selection the user already made — reloading the
-					// catalog (or remounting the panel) must not reset the ticks.
+					// Preselect the profile's configured targets and the full
+					// probe menu, but never overwrite a selection the user
+					// already made — reloading the catalog (or remounting the
+					// panel) must not reset the ticks.
+					const patch = {};
 					if (panelState.selected === null) {
-						setPanelState({ selected: new Set(payload.defaults ?? []) });
+						patch.selected = new Set(payload.defaults ?? []);
 					}
+					if (panelState.selectedProbes === null) {
+						patch.selectedProbes = new Set(payload.defaultProbes ?? (payload.probes ?? []).map((p) => p.id));
+					}
+					if (Object.keys(patch).length > 0) setPanelState(patch);
 				} catch (error) {
 					setCatalogError(error instanceof Error ? error.message : String(error));
 				} finally {
@@ -368,13 +453,31 @@ window.__ModuleLoader__.load({
 			}, [catalog]);
 			const selectNone = React.useCallback(() => setPanelState({ selected: new Set() }), []);
 
+			const toggleProbe = React.useCallback((id) => {
+				const next = new Set(panelState.selectedProbes ?? []);
+				if (next.has(id)) next.delete(id); else next.add(id);
+				setPanelState({ selectedProbes: next });
+			}, []);
+			const selectAllProbes = React.useCallback(() => {
+				setPanelState({
+					selectedProbes: new Set((catalog?.probes ?? []).map((p) => p.id))
+				});
+			}, [catalog]);
+			const selectNoProbes = React.useCallback(() => setPanelState({ selectedProbes: new Set() }), []);
+
 			const run = React.useCallback(async () => {
 				setPanelState({ phase: "running", report: null, error: null, jobId: null });
 				try {
 					const response = await fetch(api(ROUTE), {
 						method: "POST",
 						headers: { "content-type": "application/json" },
-						body: JSON.stringify({ models: Array.from(panelState.selected ?? []) })
+						body: JSON.stringify({
+							models: Array.from(panelState.selected ?? []),
+							// Send the probe selection explicitly: an absent field
+							// means "the whole battery" on the host, so omitting it
+							// would silently run everything the user unticked.
+							probes: Array.from(panelState.selectedProbes ?? [])
+						})
 					});
 					const payload = await response.json();
 					if (!response.ok) throw new Error(payload?.error ?? `HTTP ${response.status}`);
@@ -388,7 +491,7 @@ window.__ModuleLoader__.load({
 
 			const running = panelState.phase === "running";
 			const report = panelState.report;
-			const canRun = !running && !loadingModels && selected.size > 0;
+			const canRun = !running && !loadingModels && selected.size > 0 && selectedProbes.size > 0;
 
 			return React.createElement("div", { style: styles.root },
 				React.createElement("header", null,
@@ -406,14 +509,20 @@ window.__ModuleLoader__.load({
 					catalog, selected, loading: loadingModels, error: catalogError,
 					onToggle: toggle, onSelectAll: selectAll, onSelectNone: selectNone, onReload: loadModels
 				}),
+				React.createElement(ProbePicker, {
+					probes: catalog?.probes, selected: selectedProbes, loading: loadingModels,
+					onToggle: toggleProbe, onSelectAll: selectAllProbes, onSelectNone: selectNoProbes
+				}),
 				React.createElement("div", { style: styles.bar },
 					React.createElement(primitives.Button, { variant: "primary", size: "sm", onClick: run, disabled: !canRun },
 						running ? "检测中…" : "开始检测"
 					),
 					selected.size === 0 && !loadingModels &&
 						React.createElement("span", { style: styles.muted }, "请至少选择一个模型"),
+					selected.size > 0 && selectedProbes.size === 0 && !loadingModels &&
+						React.createElement("span", { style: styles.muted }, "请至少选择一项检测内容"),
 					report !== null && React.createElement("span", { style: styles.muted },
-						`共 ${report.models?.length ?? 0} 个模型 · 复杂任务 ${report.complexTrials ?? 1} 次/模型 · 推理档位 ${report.reasoningEffort ?? "默认"}`
+						`共 ${report.models?.length ?? 0} 个模型 · 检测 ${report.probes?.length ?? 0} 项 · 复杂任务 ${report.complexTrials ?? 1} 次/模型 · 推理档位 ${report.reasoningEffort ?? "默认"}`
 					)
 				),
 				panelState.error !== null && React.createElement("div", { style: styles.err }, `检测失败：${panelState.error}`),
@@ -421,8 +530,8 @@ window.__ModuleLoader__.load({
 					"正在逐个生成并执行代码。复杂任务每次生成可能需要 1–2 分钟。",
 					"检测在后台进行，可以切到别的对话或别的面板，回来时会自动接上。"
 				),
-				!running && report === null && panelState.error === null && React.createElement("div", { style: styles.empty }, "选好模型后点击「开始检测」运行探针。"),
-				report !== null && report.models?.length === 0 && React.createElement("div", { style: styles.empty }, "没有匹配到模型。请检查插件的 provider / modelPattern 配置。"),
+				!running && report === null && panelState.error === null && React.createElement("div", { style: styles.empty }, "选好模型和检测内容后，点击「开始检测」运行探针。"),
+				report !== null && report.models?.length === 0 && React.createElement("div", { style: styles.empty }, "没有匹配到模型。请检查插件配置，或在模型列表里重新勾选。"),
 				(report?.models ?? []).map((model) => React.createElement(ModelCard, { key: `${model.provider}/${model.model}`, model }))
 			);
 		}
@@ -454,7 +563,7 @@ window.__ModuleLoader__.load({
 			}
 		}
 
-		Object.assign(module.exports, { ModelPicker, PANEL_ID, ProbePanel, apply, inject });
+		Object.assign(module.exports, { ModelPicker, PANEL_ID, ProbePanel, ProbePicker, apply, inject });
 		return module.exports;
 	}
 });

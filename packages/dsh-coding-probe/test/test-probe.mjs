@@ -18,7 +18,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { COMPLEX_BRIEF, DEFAULTS, PROBES, apply, classifyFailure, execute, extractCode, inject, instrument, lastJson, listCandidates, measureRender, parseSelection, readSelection, resolveTargets, score } from "../index.js";
+import { COMPLEX_BRIEF, DEFAULTS, PROBES, apply, classifyFailure, configuredProviders, describeProbes, execute, extractCode, inject, instrument, lastJson, listCandidates, measureRender, parseSelection, probesFrom, readRequest, readSelection, resolveProbes, resolveTargets, score, selectionFrom } from "../index.js";
 
 let passed = 0;
 let failed = 0;
@@ -405,6 +405,28 @@ function mountRoute(overrides = {}, config) {
 	return mountRoutes(overrides, config).byPath["/coding-probe/run"];
 }
 
+/**
+ * Poll the run route until the current job leaves the running phase.
+ *
+ * A POST only acknowledges the start, so a test that wants the finished report
+ * has to read it back through GET — the same way the panel does.
+ *
+ * @param route - the run route.
+ * @param timeoutMs - how long to wait before failing the test.
+ * @returns the settled payload.
+ */
+async function settle(route, timeoutMs = 10000) {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const res = fakeRes();
+		await route.handler(fakeRequest("GET"), res);
+		const payload = JSON.parse(res.body);
+		if (payload.phase !== "running") return payload;
+		if (Date.now() > deadline) throw new Error(`job did not settle: ${payload.phase}`);
+		await new Promise((r) => setTimeout(r, 20));
+	}
+}
+
 /** A minimal response recorder. */
 function fakeRes() {
 	return {
@@ -750,6 +772,215 @@ await test("the catalog route refuses non-GET", async () => {
 	const res = fakeRes();
 	await byPath["/coding-probe/models"].handler(fakeRequest("POST"), res);
 	assert.equal(res.statusCode, 405);
+});
+
+console.log("模型默认值跟随 profile 配置");
+
+await test("the source ships no vendor id or model pattern as a default", () => {
+	// The defect this pins: `provider: "a1"` and `modelPattern: "gpt-6"` were
+	// baked into DEFAULTS. On any profile that does not define a1 the panel
+	// either 500s on `listModels("a1")` or preselects models the user never
+	// configured — and the plugin is installed into arbitrary profiles.
+	assert.equal(DEFAULTS.provider, "", "a hard-coded provider breaks every other profile");
+	assert.equal(DEFAULTS.modelPattern, "", "a hard-coded pattern preselects unconfigured models");
+});
+
+await test("no configured provider means every provider the profile has", async () => {
+	const targets = await resolveTargets(
+		{
+			llm: {
+				listProviders: () => [{ id: "aiinput" }, { id: "other" }],
+				listModels: async (p) => (p === "aiinput"
+					? [{ id: "deepseek-v4.1-flash" }, { id: "glm-5.3-flash" }]
+					: [{ id: "m3" }])
+			}
+		},
+		{ provider: "", modelPattern: "" }
+	);
+	assert.deepEqual(targets, [
+		{ provider: "aiinput", model: "deepseek-v4.1-flash" },
+		{ provider: "aiinput", model: "glm-5.3-flash" },
+		{ provider: "other", model: "m3" }
+	]);
+});
+
+await test("an explicit configured provider still narrows the defaults", async () => {
+	const targets = await resolveTargets(
+		{
+			llm: {
+				listProviders: () => [{ id: "aiinput" }, { id: "other" }],
+				listModels: async (p) => (p === "aiinput" ? [{ id: "kept" }] : [{ id: "dropped" }])
+			}
+		},
+		{ provider: "aiinput", modelPattern: "" }
+	);
+	assert.deepEqual(targets, [{ provider: "aiinput", model: "kept" }]);
+});
+
+await test("a pattern narrows the discovered models instead of naming a provider", async () => {
+	const targets = await resolveTargets(
+		{
+			llm: {
+				listProviders: () => [{ id: "aiinput" }],
+				listModels: async () => [{ id: "gpt-6-astra" }, { id: "deepseek-v4.1-flash" }]
+			}
+		},
+		{ provider: "", modelPattern: "gpt-6" }
+	);
+	assert.deepEqual(targets, [{ provider: "aiinput", model: "gpt-6-astra" }]);
+});
+
+await test("one unreachable provider does not blank the other defaults", async () => {
+	const targets = await resolveTargets(
+		{
+			llm: {
+				listProviders: () => [{ id: "down" }, { id: "up" }],
+				listModels: async (p) => {
+					if (p === "down") throw new Error("route down");
+					return [{ id: "ok" }];
+				}
+			}
+		},
+		{ provider: "", modelPattern: "" }
+	);
+	assert.deepEqual(targets, [{ provider: "up", model: "ok" }]);
+});
+
+await test("every configured provider failing surfaces as an error, not an empty list", async () => {
+	// An empty default list would read as "you configured no models", which
+	// sends the user looking in the wrong place.
+	await assert.rejects(
+		() => resolveTargets(
+			{ llm: { listProviders: () => [{ id: "down" }], listModels: async () => { throw new Error("429"); } } },
+			{ provider: "", modelPattern: "" }
+		),
+		/down/
+	);
+});
+
+await test("configuredProviders de-duplicates and falls back to discovery", () => {
+	const ctx = { llm: { listProviders: () => [{ id: "a" }, { id: "a" }, { id: "b" }] } };
+	assert.deepEqual(configuredProviders(ctx, {}), ["a", "b"]);
+	assert.deepEqual(configuredProviders(ctx, { provider: "only" }), ["only"]);
+	// A whitespace-only value must not be mistaken for a real provider id.
+	assert.deepEqual(configuredProviders(ctx, { provider: "  " }), ["a", "b"]);
+});
+
+console.log("检测内容选择");
+
+await test("an absent probe field means the whole battery", () => {
+	assert.deepEqual(resolveProbes(undefined).map((p) => p.id), PROBES.map((p) => p.id));
+});
+
+await test("a probe selection keeps battery order, not request order", () => {
+	// Order matters for the report: the control tier has to be read before the
+	// target tier for the verdict to make sense.
+	assert.deepEqual(resolveProbes(["pelican", "scheduler"]).map((p) => p.id), ["scheduler", "pelican"]);
+});
+
+await test("unknown probe ids resolve to nothing", () => {
+	assert.deepEqual(resolveProbes(["does-not-exist"]), []);
+});
+
+await test("the body is read once and yields both selections", async () => {
+	// A second read would consume nothing and silently drop the later field.
+	const body = await readRequest(fakeRequest("POST", { models: ["a1/x"], probes: ["pelican"] }));
+	assert.deepEqual(selectionFrom(body), ["a1/x"]);
+	assert.deepEqual(probesFrom(body), ["pelican"]);
+});
+
+await test("an explicitly empty probe selection is not upgraded to everything", async () => {
+	const body = await readRequest(fakeRequest("POST", { models: ["a1/x"], probes: [] }));
+	assert.deepEqual(probesFrom(body), [], "[] must stay empty so the route can reject it");
+	assert.equal(probesFrom({}), undefined);
+});
+
+await test("a POST runs only the selected probes", async () => {
+	const route = mountRoute(
+		{
+			llm: {
+				listProviders: () => [{ id: "a1" }],
+				listModels: async () => [{ id: "m" }],
+				// Empty but well-formed reply: every probe fails its check, which
+				// is fine — this test is about which probes ran at all.
+				stream: async function* () { yield { type: "finish", reason: "stop" }; }
+			}
+		},
+		{ provider: "a1", modelPattern: "", spacingMs: 0, complexTrials: 1 }
+	);
+	const started = fakeRes();
+	await route.handler(fakeRequest("POST", { models: ["a1/m"], probes: ["scheduler"] }), started);
+	const manifest = JSON.parse(started.body);
+	assert.deepEqual(manifest.probes.map((p) => p.id), ["scheduler"], "the manifest must describe the selection");
+
+	const report = await settle(route);
+	assert.equal(report.phase, "done");
+	assert.deepEqual(report.models[0].results.map((r) => r.id), ["scheduler"], "only the ticked probe may run");
+});
+
+await test("the whole battery still runs when no probe selection is sent", async () => {
+	const route = mountRoute(
+		{
+			llm: {
+				listProviders: () => [{ id: "a1" }],
+				listModels: async () => [{ id: "m" }],
+				stream: async function* () { yield { type: "finish", reason: "stop" }; }
+			}
+		},
+		{ provider: "a1", modelPattern: "", spacingMs: 0, complexTrials: 1 }
+	);
+	await route.handler(fakeRequest("POST", { models: ["a1/m"] }), fakeRes());
+	const report = await settle(route);
+	assert.deepEqual(report.models[0].results.map((r) => r.id), PROBES.map((p) => p.id));
+});
+
+await test("an empty probe selection is refused instead of running everything", async () => {
+	const route = mountRoute();
+	const res = fakeRes();
+	await route.handler(fakeRequest("POST", { models: ["a1/m"], probes: [] }), res);
+	assert.equal(res.statusCode, 400);
+	assert.match(JSON.parse(res.body).error, /检测内容/);
+});
+
+await test("the probe menu ships with the model catalog", async () => {
+	const { byPath } = mountRoutes(
+		{ llm: { listProviders: () => [{ id: "a1" }], listModels: async () => [{ id: "m" }] } },
+		{ provider: "", modelPattern: "" }
+	);
+	const res = fakeRes();
+	await byPath["/coding-probe/models"].handler(fakeRequest("GET"), res);
+	const payload = JSON.parse(res.body);
+	assert.deepEqual(payload.probes.map((p) => p.id), PROBES.map((p) => p.id));
+	assert.deepEqual(payload.defaultProbes, PROBES.map((p) => p.id));
+	assert.equal(payload.defaults[0], "a1/m", "defaults follow the discovered provider");
+});
+
+await test("probe descriptors carry what the picker renders and nothing more", () => {
+	const descriptors = describeProbes(PROBES);
+	for (const d of descriptors) {
+		assert.deepEqual(Object.keys(d).sort(), ["about", "id", "kind", "label", "tier"]);
+	}
+	assert.equal("prompt" in descriptors[0], false, "prompts are host-side only");
+	assert.equal("check" in descriptors[0], false, "graders are host-side only");
+});
+
+await test("only the control tier running is not called healthy", () => {
+	// The overclaim this prevents: the panel now lets the user run the controls
+	// alone, and "正常" would then assert complex generation was verified when
+	// it never ran.
+	const s = score([{ tier: "control", ok: true }, { tier: "control", ok: true }]);
+	assert.equal(s.verdict, "control-only");
+	assert.equal(s.target.total, 0);
+});
+
+await test("a control-only run that fails is still degraded", () => {
+	const s = score([{ tier: "control", ok: false }, { tier: "control", ok: true }]);
+	assert.equal(s.verdict, "degraded");
+});
+
+await test("only the target tier running still reaches a real verdict", () => {
+	const s = score([{ tier: "target", ok: true, attempts: 3, renderedCount: 3, generatedCount: 3 }]);
+	assert.equal(s.verdict, "healthy");
 });
 
 const total = passed + failed + skipped;
