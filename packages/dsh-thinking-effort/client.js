@@ -86,7 +86,7 @@ window.__ModuleLoader__.load({
 					{ style: ROW_TEXT },
 					React.createElement("div", { style: ROW_TITLE }, t("title")),
 					React.createElement("div", { style: ROW_DESC }, t("description")),
-					error !== null && React.createElement("div", { style: ROW_ERROR }, String(error))
+					unavailable && React.createElement("div", { style: ROW_ERROR }, t("unavailable"))
 				),
 				React.createElement(primitives.Switch, {
 					checked: enabled,
