@@ -32,6 +32,8 @@ import {
 	ROUTE_PREFIX,
 	UPSTREAM,
 	apply,
+	cacheStatus,
+	challengeWidth,
 	concurrencyWidth,
 	configuredProviders,
 	inject,
@@ -46,7 +48,7 @@ import {
 	runPool,
 	selectionFrom
 } from "../index.js";
-import { generateChallenges } from "../lib/challenge.js";
+import { generateChallenges, LENGTH_POOL_SIZE } from "../lib/challenge.js";
 import {
 	REQUIRED_OUTPUTS,
 	analyzeOutputs,
@@ -853,6 +855,67 @@ await test("replacement challenges keep distinct counts within a round", async (
 	assert.equal(new Set(counts).size, 3, `counts repeated within a round: ${counts}`);
 });
 
+// ---------------------------------------------------------------- speed
+
+console.log("执行速度");
+
+/** A model double whose every reply takes a fixed wall-clock time. */
+function slowLlm(ms) {
+	return {
+		listProviders: () => [{ id: "a1" }],
+		listModels: async () => [{ id: "gpt-6-astra" }],
+		stream: async function* () {
+			await new Promise((r) => setTimeout(r, ms));
+			yield { type: "text-delta", text: VALID };
+			yield { type: "finish", reason: { kind: "stop" } };
+		}
+	};
+}
+
+/** Run one round against the slow double and report wall-clock milliseconds. */
+async function timedRound(ms, overrides) {
+	const llm = slowLlm(ms);
+	const started = Date.now();
+	const report = await probeModel(
+		{ llm, logger: { info: () => {}, warn: () => {} } },
+		{ provider: "a1", model: "gpt-6-astra" },
+		{ bank, detector: DETECTOR_ARTIFACT },
+		{ ...DEFAULTS, spacingMs: 0, ...overrides },
+		() => {}
+	);
+	return { ms: Date.now() - started, report };
+}
+
+await test("a round runs its three challenges together instead of one after another", async () => {
+	const perCall = 300;
+	const serial = await timedRound(perCall, { challengeConcurrency: 1 });
+	const parallel = await timedRound(perCall, { challengeConcurrency: 3 });
+
+	// The speedup must not be bought by measuring something else: both rounds
+	// still collect three valid answers from three separate challenges.
+	assert.equal(serial.report.accepted, 3);
+	assert.equal(parallel.report.accepted, 3, "concurrency must not change what is measured");
+	assert.equal(parallel.report.total, serial.report.total);
+
+	// Three 300ms calls in series cannot finish under 900ms; overlapped they cost
+	// roughly one call plus scheduling. The bounds are loose enough for a loaded
+	// machine but far enough apart that they still fail if the pool stops
+	// overlapping — which is the only thing this test is here to catch.
+	assert.ok(serial.ms >= perCall * 3, `serial round finished too fast to have been serial: ${serial.ms}ms`);
+	assert.ok(
+		parallel.ms < serial.ms * 0.6,
+		`parallel round took ${parallel.ms}ms against ${serial.ms}ms serial — not overlapped`
+	);
+});
+
+await test("challengeConcurrency is clamped into the usable range", () => {
+	assert.equal(challengeWidth(0), 1, "zero means one at a time, not zero lanes");
+	assert.equal(challengeWidth(-5), 1);
+	assert.equal(challengeWidth(undefined), 1);
+	assert.equal(challengeWidth("2"), 2);
+	assert.equal(challengeWidth(99), REQUIRED_OUTPUTS, "cannot exceed the slots in a round");
+});
+
 // ---------------------------------------------------------------- challenges
 
 console.log("挑战生成");
@@ -1183,6 +1246,98 @@ await test("the manifest reports the effective concurrency, not the requested on
 
 await test("the default config still runs models one at a time", () => {
 	assert.equal(concurrencyWidth(DEFAULTS.concurrency), 1);
+});
+
+// ------------------------------------------------- poll safety & pool bounds
+
+console.log("轮询安全与长度池");
+
+await test("a GET that cannot resolve targets still answers 200", async () => {
+	// The regression: a 5xx here is read by the panel as a transport error, so it
+	// drops the report it is holding. A profile edited mid-run, or one provider
+	// blipping, then erased the progress of a job that was still alive. The
+	// manifest must degrade, not fail.
+	const { routes } = mountRoutes({
+		llm: {
+			listProviders: () => [{ id: "a1" }],
+			listModels: async () => {
+				throw new Error("ECONNREFUSED");
+			}
+		}
+	});
+	const res = fakeResponse();
+	await routes.get(`${ROUTE_PREFIX}/run`).handler(fakeRequest("GET"), res);
+	assert.equal(res.record.statusCode, 200, "轮询失败不能是 5xx");
+	const payload = JSON.parse(res.record.body);
+	assert.deepEqual(payload.targets, []);
+	assert.match(payload.unresolved, /ECONNREFUSED/, "必须说明为什么解析不出来");
+});
+
+await test("a GET never runs the detection, even while resolving", async () => {
+	let streamed = false;
+	const { routes } = mountRoutes({
+		llm: {
+			listProviders: () => [{ id: "a1" }],
+			listModels: async () => [{ id: "gpt-6-astra" }],
+			stream: () => {
+				streamed = true;
+				throw new Error("must not run on GET");
+			}
+		}
+	});
+	const res = fakeResponse();
+	await routes.get(`${ROUTE_PREFIX}/run`).handler(fakeRequest("GET"), res);
+	assert.equal(res.record.statusCode, 200);
+	assert.equal(streamed, false, "GET 不能碰模型路由");
+	assert.deepEqual(JSON.parse(res.record.body).targets, ["a1/gpt-6-astra"]);
+});
+
+await test("the manifest reports the effective challenge concurrency", async () => {
+	// The knob is clamped, so echoing the configured value would explain nothing
+	// about how the round actually ran.
+	const { routes } = mountRoutes({}, { provider: "a1", modelPattern: "gpt-6", challengeConcurrency: 99 });
+	const res = fakeResponse();
+	await routes.get(`${ROUTE_PREFIX}/run`).handler(fakeRequest("GET"), res);
+	assert.equal(JSON.parse(res.record.body).challengeConcurrency, REQUIRED_OUTPUTS);
+});
+
+await test("the length pool refuses to be drawn dry", () => {
+	// The bug this guards: `replacements` had no ceiling, so a large value made the
+	// round request more lengths than the pool holds, the draw produced
+	// `undefined`, and the prompt asked the model for "undefined integers" — a
+	// question with no valid answer, scored against the model.
+	assert.throws(
+		() => generateChallenges(LENGTH_POOL_SIZE + 1, [], []),
+		/耗尽/,
+		"取超了必须报错，而不是产出 undefined"
+	);
+});
+
+await test("a challenge always has a positive integer expected_count", () => {
+	// Straight through the boundary the old code fell off.
+	for (let count = 1; count <= REQUIRED_OUTPUTS; count += 1) {
+		for (const challenge of generateChallenges(count, [], [])) {
+			assert.ok(
+				Number.isInteger(challenge.expected_count) && challenge.expected_count > 0,
+				`expected_count 必须是正整数，实际是 ${challenge.expected_count}`
+			);
+			assert.ok(!challenge.prompt.includes("undefined"), "prompt 里不能出现 undefined");
+		}
+	}
+});
+
+await test("cacheStatus reuses one read instead of re-hashing the detector", () => {
+	// The panel polls this every few seconds and the file is ~4 MiB, so a fresh
+	// read + sha256 per poll is pure waste. Reference identity is the observable
+	// that proves the memo is in play — a re-read cannot return the same object.
+	// Only meaningful once the detector exists, so it is reported as skipped until
+	// then rather than passing vacuously.
+	const first = cacheStatus();
+	if (!first.cached) {
+		skipped += 1;
+		return;
+	}
+	assert.equal(cacheStatus(), first, "命中缓存时必须复用同一次读取结果");
 });
 
 // ---------------------------------------------------------------- summary

@@ -33,6 +33,7 @@
   },
   "dependencies": {
     "dsh-coding-probe": "^1.0.0",
-    "dsh-fingerprint-probe": "^1.0.0"
+    "dsh-fingerprint-probe": "^1.0.0",
+    "dsh-level-probe": "^1.0.0"
   }
 }

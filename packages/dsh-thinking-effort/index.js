@@ -45,21 +45,46 @@
  * listener is what makes it durable: every later config resolution re-applies the
  * augmentation, so an ordinary settings edit cannot silently drop it.
  *
- * ## Why `off` is omitted by default
+ * ## Why `off` is declared, and what that costs
  *
- * pi-ai's `off` handling is inverted relative to intuition. In
- * `resolveModelReasoning`, a level that is *declared* with a value is mapped to
- * that value, a level that is declared `null` stays absent from the map, and a
- * level that is *omitted* is pinned to `null`:
+ * `off` is **on by default** (`includeOff`), because the picker has to offer all
+ * seven tiers: without `off` there is no way to tell a model to stop thinking,
+ * which is the one setting a user reaches for when reasoning is burning the
+ * budget. Declaring it is a deliberate choice with a real, narrow cost.
  *
- *   - omit `off`        → `thinkingLevelMap.off === null` → pi-ai omits the
- *                         `thinking` field entirely → correct "do not think";
- *   - declare `off: null` → `thinkingLevelMap.off === undefined` → pi-ai sends
- *                         `{type: "disabled"}`, which adaptive-only models reject
- *                         with HTTP 400.
+ * The mechanism, read off the installed pi-ai rather than inferred — the two
+ * spellings differ, and the difference is a live request, not a lookup:
  *
- * Omitting `off` is therefore the portable choice, and it also removes `off`
- * from the selectable levels, which matches those models' real capability.
+ *   - `resolveModelReasoning` pins an *omitted* level to `null` in
+ *     `thinkingLevelMap`, and leaves a level *declared* `null` absent from it.
+ *     So `{off: null}` produces a map with **no `off` key**, while omitting
+ *     `off` produces `off: null`.
+ *   - pi-ai guards the disabled request with `model.thinkingLevelMap?.off !== null`
+ *     (`anthropic-messages.js`, `openai-responses.js`, `openai-completions.js`,
+ *     `openai-codex-responses.js`, `azure-openai-responses.js` all carry it).
+ *     `undefined !== null` is **true**, so the *declared* spelling is the one
+ *     that reaches the wire: the request carries an explicit
+ *     `thinking: {type: "disabled"}` (or `reasoning: {effort: "none"}`), while
+ *     the omitted spelling sends no thinking field at all.
+ *
+ * That is the opposite of the intuition this file used to record, and the
+ * "send nothing" behaviour belongs to *omitting* `off`, not to declaring it:
+ * dsh-llm-pi-ai's own comment claiming a declared `off` "stays absent from the
+ * map, which pi-ai reads as supported, send nothing" describes the wrong branch.
+ *
+ * Why declaring it still wins: pi-ai reports the selectable levels by walking
+ * this map, so a route that omits `off` has six tiers and no way back to
+ * "don't think" — and on such a model the caller's `off` is not even a no-op, it
+ * clamps *up* to the lowest thinking level and keeps thinking. Paying one
+ * `disabled` parameter is the cheaper mistake.
+ *
+ * Where it does bite: an adaptive-only route that has no catalog entry, so no
+ * `reasoningEfforts` to declare and no pi-ai catalog `compat` to inherit. If the
+ * id is not in {@link ADAPTIVE_MODELS} either — a brand-new Claude, or a gateway
+ * that renames it — the request goes out budget-shaped with `thinking.type =
+ * "disabled"`, and an adaptive-only endpoint answers HTTP 400. The fix is
+ * `includeOff: false`, which drops back to six tiers and sends no thinking field
+ * when the user picks `off`; the README says so next to the symptom.
  *
  * ## Why adaptive thinking is matched by id
  *
@@ -104,6 +129,12 @@ export const inject = ["loader"];
  */
 export const Config = z.object({
   enabled: z.boolean().default(true).volatile(),
+  /**
+   * Whether the seven-tier set includes `off`. On by default — see the module
+   * comment. It is a switch rather than a constant because the one deployment
+   * that cannot take `off` (an adaptive-only route with no declared efforts) has
+   * no other way to say so short of hand-writing `reasoningEfforts`.
+   */
   includeOff: z.boolean().default(true).volatile(),
   overwrite: z.boolean().default(false).volatile(),
   adaptiveCompat: z.boolean().default(true).volatile(),
@@ -139,8 +170,8 @@ const ADAPTIVE_MODELS = [
  * justified by "an openai-responses route would reject xhigh/max", but that is
  * not what happens: `clampThinkingLevel` walks to the nearest *available* level
  * rather than failing, and a level a route cannot express is better clamped than
- * absent. Six here plus `off` (carried by `includeOff`, since `off` is the
- * absence of a wire value rather than one) is the seven the picker shows.
+ * absent. Six here plus `off` (carried by `includeOff`, because `off` is declared
+ * as a bare `null` rather than a wire spelling) is the seven the picker shows.
  */
 const DEFAULT_LEVELS = {
   minimal: "minimal",
@@ -178,7 +209,8 @@ export function normalizeConfig(config) {
   // Absent means on. Anything explicitly falsy means off, including `0` and
   // `""`: the profile schema coerces those to a boolean already, but the loader
   // can also activate a plugin without schema validation, and reading `0` as "on"
-  // there would silently ignore a user's `enabled: 0`.
+  // there would silently ignore a user's `enabled: 0`. `includeOff` reads the same
+  // way, and its default is the documented one: seven tiers, `off` included.
   return {
     enabled: source.enabled === undefined ? true : Boolean(source.enabled),
     levels,
@@ -197,9 +229,15 @@ export function normalizeConfig(config) {
 /**
  * Build the `reasoningEfforts` block for one model.
  *
- * `off: null` is written only when explicitly requested. See the module comment:
- * declaring `off` with a null value is *not* the same as omitting it, and sends
- * an explicit `{type: "disabled"}` that adaptive-only models reject.
+ * `off: null` is written by default. Declaring it is what makes pi-ai emit the
+ * explicit `disabled` parameter — and, just as importantly, what keeps `off` in
+ * the picker at all: pi-ai derives the selectable levels from this map, and a
+ * level pinned to `null` (which is what an *omitted* `off` becomes downstream)
+ * is filtered out of that list. Six tiers with no way to stop thinking is worse
+ * than one `disabled` parameter. See the module comment for the full mechanism.
+ *
+ * @param settings - see {@link normalizeConfig}.
+ * @returns level → wire spelling, `off` mapped to `null` when included.
  */
 export function buildEfforts(settings) {
   const efforts = settings.includeOff ? { off: null } : {};

@@ -1,5 +1,3 @@
-window.__DSH_PROBE_MERGED__ = true;
-
 window.__ModuleLoader__.load({
 	id: "dsh-probe",
 	factory: (require) => {
@@ -12,15 +10,29 @@ window.__ModuleLoader__.load({
 
 		// Each half's client bundle IS its package's client half, so the subpath
 		// and the bare name resolve to the same exports.
+		//
+		// Requiring them here is also what orders the module graph: the panel is a
+		// consumer, so the halves are placed first. That ordering is why the halves
+		// must not try to detect the merge at runtime — by the time this bundle runs
+		// and could announce it, their `apply` has already been called. They own
+		// nothing, and this panel owns the single rail entry and the `main` seat.
 		const coding = require("dsh-coding-probe/client");
 		const fingerprint = require("dsh-fingerprint-probe/client");
+		const levels = require("dsh-level-probe/client");
 
 		const PANEL_ID = "probe";
 
-		/** The tabs; `component` is the half's own panel body. */
+		/**
+		 * The tabs, in the order {@link HALVES} declares them.
+		 *
+		 * The ids and labels are spelled out rather than imported from the host
+		 * module because a client bundle cannot import host ESM; keeping the two
+		 * lists in the same order is the contract, and `test-merge.mjs` pins it.
+		 */
 		const TABS = [
 			{ id: "coding", label: "编码能力", component: coding.ProbePanel },
-			{ id: "fingerprint", label: "模型指纹", component: fingerprint.FingerprintPanel }
+			{ id: "fingerprint", label: "模型指纹", component: fingerprint.FingerprintPanel },
+			{ id: "levels", label: "档位探测", component: levels.LevelPanel }
 		];
 
 		/**
@@ -120,7 +132,11 @@ window.__ModuleLoader__.load({
 		const inject = ["slots"];
 
 		/**
-		 * Register the sidebar button and its panel body.
+		 * Register the single sidebar button and its panel body.
+		 *
+		 * This is the only rail entry any of the four probe bundles registers. The
+		 * halves deliberately register nothing, so there is exactly one button for
+		 * all three probes no matter what order the bundles load in.
 		 *
 		 * @param ctx - the client root context.
 		 */

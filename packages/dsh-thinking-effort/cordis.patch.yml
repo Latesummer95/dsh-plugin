@@ -20,11 +20,14 @@
 #     # extended levels; `minimal` is omitted because Anthropic's effort enum
 #     # has no such value.
 #     levels: { low: low, medium: medium, high: high, xhigh: xhigh, max: max }
-#     # Declare `off` as well. Off by default, and deliberately so: pi-ai treats
-#     # a *declared* `off: null` as "send thinking.type = disabled", which the
-#     # adaptive-only models reject with HTTP 400, whereas an *omitted* `off`
-#     # means "send no thinking field at all".
-#     includeOff: false
+#     # Declare `off` as well, giving the full seven tiers. **On by default**, so
+#     # the picker can always turn thinking back off. The cost is one extra
+#     # parameter: pi-ai sends `thinking.type = "disabled"` for a *declared*
+#     # `off: null`, and an adaptive-only route that has no catalog entry and no
+#     # `adaptiveModels` match answers that with HTTP 400. Set this to `false` to
+#     # drop back to six tiers and send no thinking field for `off` — the
+#     # `includeOff` doc block in `index.js` has the full mechanism.
+#     includeOff: true
 #     # Replace a `reasoningEfforts` the profile already declares. Off by
 #     # default, so a hand-tuned model keeps its own levels.
 #     overwrite: false

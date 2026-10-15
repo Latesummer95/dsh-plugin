@@ -38,7 +38,7 @@
  * @module dsh-fingerprint-probe
  */
 
-import { generateChallenges, LANGUAGE_IDS, LANGUAGE_LABELS } from "./lib/challenge.js";
+import { generateChallenges, LANGUAGE_IDS, LANGUAGE_LABELS, LENGTH_POOL_SIZE } from "./lib/challenge.js";
 import { loadReference, loadBankMeta, cacheStatus, UPSTREAM } from "./lib/data.js";
 import { analyzeOutputs, parseNumbers, REQUIRED_OUTPUTS } from "./lib/detector.js";
 
@@ -89,6 +89,15 @@ const DEFAULTS = {
 	timeoutMs: 180000,
 	/** Models to probe concurrently, 1–{@link MAX_CONCURRENCY}. Gateways throttle hard, so the default is one at a time. */
 	concurrency: 1,
+	/**
+	 * Challenges in flight at once *within* one model.
+	 *
+	 * The round's three challenges are independent, so this shortens a round
+	 * roughly in proportion without changing what is measured. Set it to `1` to
+	 * restore the strictly serial behaviour (which is also when `spacingMs`
+	 * between challenges applies again).
+	 */
+	challengeConcurrency: REQUIRED_OUTPUTS,
 	/** Pause between models in milliseconds. */
 	spacingMs: 1500,
 	/**
@@ -473,7 +482,6 @@ async function elicit(ctx, target, challenge, config) {
  */
 async function probeModel(ctx, target, reference, config, onProgress) {
 	const label = `${target.provider}/${target.model}`;
-	const attempts = [];
 	// Counts stay distinct within the round so a replacement cannot duplicate a
 	// challenge still in play, matching how the reference bank was collected.
 	const used = [];
@@ -483,28 +491,58 @@ async function probeModel(ctx, target, reference, config, onProgress) {
 		return challenge;
 	};
 
-	for (let slot = 0; slot < REQUIRED_OUTPUTS; slot += 1) {
-		let challenge = draw();
-		let attempt;
-		for (let retry = 0; retry <= config.replacements; retry += 1) {
-			onProgress?.(
-				`${label}：挑战 ${slot + 1}/${REQUIRED_OUTPUTS}（${LANGUAGE_LABELS[challenge.language] ?? challenge.language}，要求 ${challenge.expected_count} 个整数）` +
-					(retry > 0 ? `，第 ${retry + 1} 次尝试` : "")
-			);
-			attempt = await elicit(ctx, target, challenge, config);
-			// Only a transport-level failure is worth re-asking: the model never
-			// answered, so this is a fresh draw rather than a second opinion on
-			// the same question. A model that answered but wrote too few numbers
-			// has given its answer, and re-rolling it would bias the sample.
-			if (attempt.accepted || attempt.answered) break;
-			if (retry < config.replacements) {
-				challenge = draw();
-				if (config.spacingMs > 0) await new Promise((r) => setTimeout(r, config.spacingMs));
+	// Every slot draws its challenge *before* any request goes out. Drawing lazily
+	// from inside the pool would make the distinct-count invariant depend on
+	// completion order — which is the one thing concurrency removes.
+	const slots = Array.from({ length: REQUIRED_OUTPUTS }, () => draw());
+	const width = challengeWidth(config.challengeConcurrency);
+	// `spacingMs` exists to keep a *serial* round under the gateway's burst limit.
+	// Once lanes are in flight it only adds latency to work already running, so it
+	// stays a property of the one-at-a-time case.
+	const pace = width === 1 && config.spacingMs > 0;
+	// Clamped to what the length pool can actually supply. Each slot draws one
+	// length and each replacement draws another, so a round consumes
+	// `REQUIRED_OUTPUTS * (1 + replacements)` lengths for the session. Past the
+	// pool size the draw once produced `expected_count: undefined` — a prompt
+	// asking for "undefined integers" — and the round was scored against it. The
+	// knob is clamped here rather than rejected so an over-eager config degrades
+	// into "retried as much as possible" instead of failing the whole run.
+	const maxReplacements = Math.max(0, Math.floor(LENGTH_POOL_SIZE / REQUIRED_OUTPUTS) - 1);
+	const requestedReplacements = Math.max(0, Number(config.replacements) || 0);
+	const replacements = Math.min(requestedReplacements, maxReplacements);
+	// Indexed, not pushed: requests finish out of order, and the scorer reads the
+	// attempts as a set of slot positions rather than as a log of arrivals.
+	const attempts = new Array(REQUIRED_OUTPUTS);
+
+	await runPool(
+		slots.map((challenge, slot) => ({ challenge, slot })),
+		width,
+		async ({ challenge, slot }, remaining) => {
+			let current = challenge;
+			let attempt;
+			for (let retry = 0; retry <= replacements; retry += 1) {
+				onProgress?.(
+					`${label}：挑战 ${slot + 1}/${REQUIRED_OUTPUTS}（${LANGUAGE_LABELS[current.language] ?? current.language}，要求 ${current.expected_count} 个整数）` +
+						(retry > 0 ? `，第 ${retry + 1} 次尝试` : "")
+				);
+				attempt = await elicit(ctx, target, current, config);
+				// Only a transport-level failure is worth re-asking: the model never
+				// answered, so this is a fresh draw rather than a second opinion on
+				// the same question. A model that answered but wrote too few numbers
+				// has given its answer, and re-rolling it would bias the sample.
+				if (attempt.accepted || attempt.answered) break;
+				if (retry < replacements) {
+					current = draw();
+					if (pace) await new Promise((r) => setTimeout(r, config.spacingMs));
+				}
 			}
+			attempts[slot] = attempt;
+			// The serial path still paces between its slots, exactly as it did
+			// before this loop became a pool; only the last slot skips the wait,
+			// since there is nothing left for it to protect.
+			if (pace && remaining > 0) await new Promise((r) => setTimeout(r, config.spacingMs));
 		}
-		attempts.push(attempt);
-		if (slot < REQUIRED_OUTPUTS - 1 && config.spacingMs > 0) await new Promise((r) => setTimeout(r, config.spacingMs));
-	}
+	);
 
 	// All three attempts are handed to the scorer, not just the accepted ones:
 	// it applies the acceptance rule itself and reports `used_outputs` against
@@ -549,6 +587,29 @@ const MAX_CONCURRENCY = 2;
  */
 function concurrencyWidth(value) {
 	return Math.max(1, Math.min(Number(value) || 1, MAX_CONCURRENCY));
+}
+
+/**
+ * How many of one model's challenges may be in flight at once.
+ *
+ * The three challenges of a round are independent draws from the same bank, so
+ * running them together measures exactly what running them in sequence does —
+ * the model still answers three separate questions, and the scorer still sees
+ * three attempts. The only thing that changes is wall-clock: a round used to cost
+ * the *sum* of three long completions plus two `spacingMs` pauses, and it now
+ * costs roughly the slowest one.
+ *
+ * This is deliberately separate from `concurrency` (models at a time). Fanning
+ * out inside a model is safe in a way fanning out across models is not: three
+ * requests against the same route are one connection's worth of load, and the
+ * `spacingMs` throttle the serial path needed exists precisely because those
+ * three were being sent back to back anyway.
+ *
+ * @param value - the configured `challengeConcurrency`.
+ * @returns an integer in `[1, REQUIRED_OUTPUTS]`.
+ */
+function challengeWidth(value) {
+	return Math.max(1, Math.min(Math.floor(Number(value) || 1), REQUIRED_OUTPUTS));
 }
 
 /**
@@ -754,26 +815,45 @@ function apply(ctx, config = {}) {
 					// An absent field means every language; an explicit one is
 					// already filtered to known ids.
 					const languages = askedLanguages === undefined ? [] : askedLanguages;
-					let targets;
-					try {
-						targets = await resolveTargets(ctx, cfg, requested);
-					} catch (error) {
-						sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
-						return;
-					}
-					const manifest = {
-						provider: cfg.provider,
-						modelPattern: cfg.modelPattern ?? null,
-						reasoningEffort: cfg.reasoningEffort,
-						timeoutMs: cfg.timeoutMs,
-						// The effective value, not the configured one: the knob is
-						// clamped, and a panel that echoed 8 back would explain
-						// nothing about why the round ran two at a time.
-						concurrency: concurrencyWidth(cfg.concurrency),
-						upstream: UPSTREAM,
-						cache: cacheStatus(),
-						languages: languages.length > 0 ? languages : [...LANGUAGE_IDS],
-						targets: targets.map((t) => `${t.provider}/${t.model}`)
+					/**
+					 * Describe what a POST would run, without ever failing the GET.
+					 *
+					 * Target resolution is the one step here that can throw — a route
+					 * whose `listModels` is down, or a profile edited mid-run. Letting
+					 * that become a 5xx is what erased a live run's report from the
+					 * panel, which treats a failed poll as a transport error and clears
+					 * what it is holding. So the throw is caught and reported inside a
+					 * 200: the panel shows "could not resolve" and keeps its progress.
+					 *
+					 * Returns the resolved targets as well as the manifest, because the
+					 * POST path needs the objects to run while the wire format needs the
+					 * `provider/model` strings.
+					 */
+					const describe = async () => {
+						let targets = [];
+						let unresolved;
+						try {
+							targets = await resolveTargets(ctx, cfg, requested);
+						} catch (error) {
+							unresolved = error instanceof Error ? error.message : String(error);
+						}
+						const manifest = {
+							provider: cfg.provider,
+							modelPattern: cfg.modelPattern ?? null,
+							reasoningEffort: cfg.reasoningEffort,
+							timeoutMs: cfg.timeoutMs,
+							// The effective values, not the configured ones: both knobs
+							// are clamped, and a panel echoing 8 back would explain
+							// nothing about why the round ran two at a time.
+							concurrency: concurrencyWidth(cfg.concurrency),
+							challengeConcurrency: challengeWidth(cfg.challengeConcurrency),
+							upstream: UPSTREAM,
+							cache: cacheStatus(),
+							languages: languages.length > 0 ? languages : [...LANGUAGE_IDS],
+							targets: targets.map((t) => `${t.provider}/${t.model}`),
+							...(unresolved === undefined ? {} : { unresolved })
+						};
+						return { manifest, targets };
 					};
 					// GET reports the current job's state, or what WOULD run when
 					// nothing has run yet, and always returns immediately. Running
@@ -782,7 +862,7 @@ function apply(ctx, config = {}) {
 					if (req.method === "GET") {
 						const job = runs.current();
 						if (job === null) {
-							sendJson(res, 200, { phase: "idle", ...manifest });
+							sendJson(res, 200, { phase: "idle", ...(await describe()).manifest });
 							return;
 						}
 						sendJson(res, 200, {
@@ -791,8 +871,16 @@ function apply(ctx, config = {}) {
 							startedAt: job.startedAt,
 							finishedAt: job.finishedAt,
 							error: job.error,
-							...(job.report ?? manifest)
+							...(job.report ?? (await describe()).manifest)
 						});
+						return;
+					}
+					// POST. A resolution failure here IS fatal: there is nothing to
+					// run, and the caller must be told rather than handed an empty
+					// battery that looks like a completed clean run.
+					const { manifest, targets } = await describe();
+					if (manifest.unresolved !== undefined) {
+						sendJson(res, 500, { error: manifest.unresolved });
 						return;
 					}
 					// POST starts the job and returns at once. The panel polls GET,
@@ -902,6 +990,7 @@ export {
 	UPSTREAM,
 	apply,
 	cacheStatus,
+	challengeWidth,
 	concurrencyWidth,
 	configuredProviders,
 	describeLanguages,

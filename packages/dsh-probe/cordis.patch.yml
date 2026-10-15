@@ -1,52 +1,54 @@
 # dsh-probe bundle patch.
 #
-# Adds ONE host row: the merged panel that mounts both probes. The two halves
-# (`dsh-coding-probe`, `dsh-fingerprint-probe`) stay independent packages and are
-# pulled in as dependencies, not re-declared here.
+# Adds four host rows: the three probes, and the panel that shows them as tabs.
+#
+# ## Why the probes are separate rows
+#
+# Each probe owns its own routes and its own client bundle, and a package's client
+# bundle is only served when the package has a loader entry. So each needs its own
+# row — and each row carries that probe's config, because **a config given to the
+# panel row does not reach the probes**. An earlier version of this file tried to
+# configure all three through the panel's `config:` slice; the panel mounted them a
+# second time to apply it, the host rejected the duplicate routes, and the slices
+# were silently dropped. Configure a probe on its own row, below.
 #
 # A patch replaces the targeted row's whole `config`, so this file contains only
-# an additive `insert` row and never restates a shipped row. `name` resolves
-# relative to this file.
-#
-# Optional config — anything outside `coding` / `fingerprint` is shared by both
-# halves, and each half's own slice overrides the shared value:
-#
-#   config:
-#     provider: ""            # shared; empty = every configured provider
-#     concurrency: 1          # shared
-#     coding:
-#       modelPattern: ""      # empty = no filter
-#       reasoningEffort: null # null omits the field
-#       complexTrials: 3
-#     fingerprint:
-#       languages: [zh, en]   # empty = all five
-#       reasoningEffort: null
-#       spacingMs: 1500
+# additive `insert` rows and never restates a shipped row. `name` resolves relative
+# to this file.
 #
 # No provider id is named here on purpose. These defaults ship to every profile,
-# and a route id that only exists on the author's machine is either a hard
-# failure (`listModels` on an unknown provider) or a silent preselection of
-# models the user never configured. Empty means "read what this profile has".
+# and a route id that only exists on the author's machine is either a hard failure
+# (`listModels` on an unknown provider) or a silent preselection of models the user
+# never configured. Empty means "read what this profile has".
 - insert:
-    # The halves stay loader entries: each owns its own routes and its own client
-    # bundle, and `dsh-probe/client.js` requires them by name. They no longer add
-    # a rail button — `window.__DSH_PROBE_MERGED__` turns each into a tab instead.
+    # `reasoningEffort: null` omits the field. Sending an effort the route does not
+    # accept fails every probe, which looks like a degraded model rather than a
+    # misconfiguration — so the shipped default is to omit it.
     - id: coding-probe
       name: 'dsh-coding-probe'
+      config:
+        provider: ""
+        modelPattern: ""
+        reasoningEffort: null
+        complexTrials: 3
+
     - id: fingerprint-probe
       name: 'dsh-fingerprint-probe'
+      config:
+        provider: ""
+        reasoningEffort: null
+        spacingMs: 1500
+
+    - id: level-probe
+      name: 'dsh-level-probe'
+      config:
+        provider: ""
+        # Two distinct questions per level: one cannot tell "this level thinks
+        # more" apart from "this answer ran long".
+        tasksPerLevel: 2
+
+    # The panel itself. It has no config: it renders tabs and requires each probe's
+    # client bundle by name. Nothing here may mount a probe — see the module doc in
+    # `index.js` for the defect that caused.
     - id: probe
       name: './index.js'
-      config:
-        concurrency: 1
-        coding:
-          provider: ""
-          # `null` omits the field. Sending an effort the route does not accept
-          # fails every probe, which looks like a degraded model rather than a
-          # misconfiguration — so the shipped default is to omit it.
-          reasoningEffort: null
-          complexTrials: 3
-        fingerprint:
-          provider: ""
-          reasoningEffort: null
-          spacingMs: 1500

@@ -1,16 +1,24 @@
 /**
  * Tests for the merged dsh-probe host.
  *
- * The merge must be behaviour-neutral for the two halves: same routes, same
- * config, and a failing half that does not take the other one down. These tests
- * pin those three things, because "it still renders" is exactly the claim a merge
- * cannot make on its own.
+ * The merge is a *client-side* arrangement: the panel renders the tabs, and the
+ * halves keep their own routes, their own client bundles and their own config.
+ * That split is what these tests pin, because the failure mode it guards against
+ * was completely silent.
+ *
+ * An earlier version had the panel mount the halves on the host as well, to apply
+ * per-half config slices. Every route the halves had already registered through
+ * their own loader rows got registered a second time, the host rejected the
+ * duplicate, and the per-half `try` swallowed the throw — so the only symptom was
+ * that the config in the patch never took effect. These tests therefore assert the
+ * *absence* of host-side mounting, which is the fix.
  *
  * Run with `node test/test-merge.mjs`.
  */
 
 import assert from "node:assert/strict";
-import { HALVES, apply as mount, name } from "../index.js";
+import { readFileSync } from "node:fs";
+import { HALVES, apply as mount, inject, name } from "../index.js";
 
 let passed = 0;
 let fail = 0;
@@ -27,90 +35,89 @@ async function test(label, fn) {
   }
 }
 
-/** A context that records what each half was mounted with. */
+/** A context that records every service the panel touches. */
 function makeCtx() {
-  const warnings = [];
+  const calls = [];
   return {
-    warnings,
-    logger: { warn: (...args) => warnings.push(args.join(" ")) },
-    on: () => {},
+    calls,
+    logger: { warn: (...args) => calls.push(["warn", args.join(" ")]) },
+    on: (...args) => calls.push(["on", ...args]),
+    llm: { listProviders: () => calls.push(["llm.listProviders"]) },
+    webServer: { register: (...args) => calls.push(["webServer.register", ...args]) },
   };
 }
 
-/**
- * ESM namespace objects are frozen, so the halves cannot be monkey-patched.
- * `mount` is therefore invoked through a local copy of the HALVES shape rather
- * than through the exported, immutable one.
- */
-function mountWith(ctx, config, halfImpl) {
-  mount(ctx, config, halfImpl);
-}
-
-await test("the plugin mounts both halves", async () => {
+await test("the panel declares the three probes in tab order", async () => {
   assert.equal(name, "probe");
-  assert.equal(HALVES.length, 2);
-  assert.deepEqual(HALVES.map((h) => h.id), ["coding", "fingerprint"]);
+  assert.deepEqual(HALVES.map((h) => h.id), ["coding", "fingerprint", "levels"]);
+  assert.deepEqual(HALVES.map((h) => h.label), ["编码能力", "模型指纹", "档位探测"]);
 });
 
-await test("apply mounts every half exactly once", () => {
+await test("the panel injects no services", async () => {
+  // It owns no routes and no state; a declared injection would only gate the
+  // client bundle behind a service it never uses.
+  assert.deepEqual(inject, []);
+});
+
+await test("apply mounts nothing on the host", () => {
+  // The regression pin. Mounting a half here re-registers its routes, the host
+  // rejects the duplicate, and the throw is swallowed — leaving the halves running
+  // on their built-in defaults while the patch's config silently does nothing.
   const ctx = makeCtx();
-  const calls = [];
-  mountWith(ctx, {}, [
-    { id: "coding", module: { apply: () => calls.push("coding") } },
-    { id: "fingerprint", module: { apply: () => calls.push("fingerprint") } },
-  ]);
-  assert.deepEqual(calls, ["coding", "fingerprint"]);
+  mount(ctx);
+  assert.deepEqual(ctx.calls, [], `面板不应触碰任何服务：${JSON.stringify(ctx.calls)}`);
 });
 
-await test("a shared config reaches both halves", () => {
-  const ctx = makeCtx();
-  const seen = [];
-  mountWith(ctx, { provider: "a1", complexTrials: 5 }, [
-    { id: "coding", module: { apply: (_c, config) => seen.push(["coding", config]) } },
-    { id: "fingerprint", module: { apply: (_c, config) => seen.push(["fingerprint", config]) } },
-  ]);
-  assert.equal(seen.length, 2);
-  for (const [, config] of seen) {
-    assert.equal(config.provider, "a1", "共享配置没有传下去");
-    assert.equal(config.complexTrials, 5);
-  }
+await test("apply survives a context with no logger at all", () => {
+  // A loader may hand `apply` a bare context; nothing here may assume otherwise.
+  assert.doesNotThrow(() => mount({}));
 });
 
-await test("a per-half config overrides the shared one", () => {
-  const ctx = makeCtx();
-  const seen = [];
-  mountWith(ctx, { provider: "a1", complexTrials: 5, coding: { complexTrials: 9 } }, [
-    { id: "coding", module: { apply: (_c, config) => seen.push(["coding", config]) } },
-    { id: "fingerprint", module: { apply: (_c, config) => seen.push(["fingerprint", config]) } },
-  ]);
-  const byId = Object.fromEntries(seen);
-  assert.equal(byId.coding.complexTrials, 9, "半区配置没有覆盖共享值");
-  assert.equal(byId.coding.provider, "a1", "未指定的字段应继承共享值");
-  assert.equal(byId.fingerprint.complexTrials, 5, "另一个半区不应被影响");
+await test("the panel does not import the halves", () => {
+  // Importing them is how the double-mount started: it made `half.module.apply`
+  // reachable from this module, and a reachable mount point is one that gets used.
+  // The client bundle requires them by name instead, which is a browser-side
+  // import that cannot run host code.
+  const source = readFileSync(new URL("../index.js", import.meta.url), "utf8");
+  const imports = [...source.matchAll(/^import\s.*?from\s+"([^"]+)"/gm)].map((m) => m[1]);
+  assert.deepEqual(imports, [], `面板不应 import 任何半区：${JSON.stringify(imports)}`);
 });
 
-await test("a half that throws does not take the other one down", () => {
-  const ctx = makeCtx();
-  const mounted = [];
-  mountWith(ctx, {}, [
-    { id: "coding", module: { apply: () => { throw new Error("reference bank missing"); } } },
-    { id: "fingerprint", module: { apply: () => mounted.push("fingerprint") } },
-  ]);
-  assert.deepEqual(mounted, ["fingerprint"], "健康的半区没有挂上");
-  assert.ok(
-    ctx.warnings.some((line) => line.includes("reference bank missing")),
-    `没有记录失败原因：${JSON.stringify(ctx.warnings)}`,
-  );
-});
-
-await test("both halves keep their own route prefix", async () => {
+await test("each half keeps its own route prefix", async () => {
   // A merged panel that repointed one half's routes would break an old client
   // bundle and any run started before the merge.
   const { ROUTE_PREFIX: codingRoute } = await import("dsh-coding-probe");
   const { ROUTE_PREFIX: fingerprintRoute } = await import("dsh-fingerprint-probe");
+  const { ROUTE_PREFIX: levelRoute } = await import("dsh-level-probe");
   assert.equal(codingRoute, "/coding-probe");
   assert.equal(fingerprintRoute, "/fingerprint-probe");
-  assert.notEqual(codingRoute, fingerprintRoute);
+  assert.equal(levelRoute, "/level-probe");
+  assert.equal(new Set([codingRoute, fingerprintRoute, levelRoute]).size, 3);
+});
+
+await test("the patch gives each probe its own row and its own config", () => {
+  // A config on the panel row does not reach the probes, so each probe's settings
+  // must live on the probe's own row. Reading the shipped patch is the only way to
+  // catch a well-meaning edit that moves them back.
+  const patch = readFileSync(new URL("../cordis.patch.yml", import.meta.url), "utf8");
+  for (const [id, key] of [
+    ["coding-probe", "complexTrials"],
+    ["fingerprint-probe", "spacingMs"],
+    ["level-probe", "tasksPerLevel"],
+  ]) {
+    const row = patch.split(/\n\s*- id: /).find((block) => block.startsWith(id));
+    assert.ok(row !== undefined, `patch 里缺少 ${id} 行`);
+    assert.ok(row.includes(`${key}:`), `${id} 行没有自己的 ${key} 配置`);
+  }
+});
+
+await test("the panel's own row carries no config", () => {
+  // Anything written there would be silently ignored, which is the trap this whole
+  // file exists to prevent someone from walking back into.
+  const patch = readFileSync(new URL("../cordis.patch.yml", import.meta.url), "utf8");
+  const row = patch.split(/\n\s*- id: /).find((block) => block.startsWith("probe"));
+  assert.ok(row !== undefined, "patch 里缺少 probe 行");
+  assert.ok(!/^\s+config:/m.test(row), "面板行不应有 config（它不会生效）");
 });
 
 console.log("");

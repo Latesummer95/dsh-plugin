@@ -25,8 +25,37 @@ function choose(values) {
 	return values[randomIndex(values.length)];
 }
 
+/**
+ * How many distinct challenge lengths exist, 292 through 332 inclusive.
+ *
+ * Exported because it bounds something the caller must respect: every draw takes
+ * one length out of the pool for the rest of the session, so the total number of
+ * draws a round may request is `LENGTH_POOL_SIZE`, and the replacement budget has
+ * to be derived from it rather than picked freely.
+ */
+export const LENGTH_POOL_SIZE = 41;
+
+/**
+ * Pick `count` unused lengths.
+ *
+ * The explicit exhaustion check is not defensive decoration. The splice below
+ * returns an empty array once the pool runs out, so `[0]` is `undefined` — and an
+ * earlier version pushed exactly that, producing a challenge whose
+ * `expected_count` was `undefined` and a prompt reading "give undefined integers"
+ * ("要求 undefined 个整数"). The model then answered a question with no valid
+ * answer and the round was scored against it. Failing loudly names the real
+ * problem instead of manufacturing an unanswerable prompt.
+ */
 function uniqueLengths(count, usedLengths) {
-	const available = Array.from({ length: 41 }, (_, index) => 292 + index).filter((length) => !usedLengths.includes(length));
+	const available = Array.from({ length: LENGTH_POOL_SIZE }, (_, index) => 292 + index).filter(
+		(length) => !usedLengths.includes(length)
+	);
+	if (count > available.length) {
+		throw new Error(
+			`挑战长度池已耗尽：需要 ${count} 个，仅剩 ${available.length} 个。` +
+				`请减少 replacements（每个会话最多 ${LENGTH_POOL_SIZE} 次取数）后重试。`
+		);
+	}
 	const output = [];
 	while (output.length < count) output.push(available.splice(randomIndex(available.length), 1)[0]);
 	return output;

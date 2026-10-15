@@ -253,23 +253,23 @@ await test("the instrumentation declares payload outside the try block", () => {
 });
 
 console.log("calibration: the judge must reject broken programs");
-await test("a correct event-loop ordering passes", () => {
+await test("a correct event-loop ordering passes", async () => {
 	const code = `const log=[];log.push('A');setTimeout(()=>log.push('D'),0);
 Promise.resolve().then(()=>log.push('C'));log.push('B');
 setTimeout(()=>console.log(JSON.stringify({order:log.join('')})),10);`;
-	assert.equal(execute(byId.scheduler, code, CFG).ok, true);
+	assert.equal((await execute(byId.scheduler, code, CFG)).ok, true);
 });
-await test("treating a microtask as a macrotask fails", () => {
+await test("treating a microtask as a macrotask fails", async () => {
 	const code = `const log=[];log.push('A');setTimeout(()=>log.push('D'),0);
 setTimeout(()=>log.push('C'),0);log.push('B');
 setTimeout(()=>console.log(JSON.stringify({order:log.join('')})),10);`;
-	assert.equal(execute(byId.scheduler, code, CFG).ok, false);
+	assert.equal((await execute(byId.scheduler, code, CFG)).ok, false);
 });
-await test("a program that throws fails", () => {
-	assert.equal(execute(byId.scheduler, "throw new Error('nope');", CFG).ok, false);
+await test("a program that throws fails", async () => {
+	assert.equal((await execute(byId.scheduler, "throw new Error('nope');", CFG)).ok, false);
 });
-await test("an empty reply fails rather than passing vacuously", () => {
-	assert.equal(execute(byId.scheduler, "", CFG).ok, false);
+await test("an empty reply fails rather than passing vacuously", async () => {
+	assert.equal((await execute(byId.scheduler, "", CFG)).ok, false);
 });
 
 if (hasChrome()) {
@@ -297,23 +297,23 @@ const gl=document.getElementById('c').getContext('webgl');
 gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);
 </script></body></html>`;
 
-	await test("a correct hand-written WebGL triangle renders green", () => {
-		const r = execute(byId.simple_gl, GOOD_GL, CFG);
+	await test("a correct hand-written WebGL triangle renders green", async () => {
+		const r = await execute(byId.simple_gl, GOOD_GL, CFG);
 		assert.equal(r.ok, true, `expected pass, got ${r.detail}`);
 	});
-	await test("WebGL2 calls on a WebGL1 context are caught", () => {
-		const r = execute(byId.simple_gl, BAD_GL, CFG);
+	await test("WebGL2 calls on a WebGL1 context are caught", async () => {
+		const r = await execute(byId.simple_gl, BAD_GL, CFG);
 		assert.equal(r.ok, false, "the degraded program must not pass");
 		assert.match(r.detail, /createVertexArray/);
 	});
-	await test("a blank canvas with no exception is still a failure", () => {
+	await test("a blank canvas with no exception is still a failure", async () => {
 		// The critical case: silent success. Grading on "no exception" alone
 		// would report this as healthy.
-		const r = execute(byId.complex_scene, SILENT_BLANK, CFG);
+		const r = await execute(byId.complex_scene, SILENT_BLANK, CFG);
 		assert.equal(r.ok, false, "a silent blank render must not pass");
 		assert.match(r.detail, /未渲染|非黑/);
 	});
-	await test("a scene that renders with colour spread passes the render check", () => {
+	await test("a scene that renders with colour spread passes the render check", async () => {
 		// A multi-colour scene, closer to the real brief than a flat fill.
 		const code = `<!doctype html><html><body><canvas id="c" width="200" height="200"></canvas><script>
 const gl=document.getElementById('c').getContext('webgl');
@@ -328,11 +328,11 @@ const l=gl.getAttribLocation(pr,'p');gl.enableVertexAttribArray(l);
 gl.vertexAttribPointer(l,2,gl.FLOAT,false,0,0);
 gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);gl.drawArrays(gl.TRIANGLES,0,3);
 </script></body></html>`;
-		const r = execute(byId.complex_scene, code, CFG);
+		const r = await execute(byId.complex_scene, code, CFG);
 		assert.equal(r.ok, true, `expected pass, got ${r.detail}`);
 		assert.ok(r.evidence.distinctColors >= 8, `expected colour spread, got ${r.evidence.distinctColors}`);
 	});
-	await test("an un-resized default canvas is reported as evidence", () => {
+	await test("an un-resized default canvas is reported as evidence", async () => {
 		// The captured failure never resized its canvas from the 300x150
 		// default, which is itself proof that its setup code never ran.
 		// The canvas must therefore be declared WITHOUT width/height here.
@@ -340,7 +340,7 @@ gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);gl.drawArrays(gl.TRIANGLES,
 const gl=document.querySelector('canvas').getContext('webgl');
 gl.createVertexArray();
 </script></body></html>`;
-		const r = execute(byId.complex_scene, code, CFG);
+		const r = await execute(byId.complex_scene, code, CFG);
 		assert.equal(r.ok, false);
 		assert.equal(r.evidence.canvasW, 300);
 		assert.equal(r.evidence.canvasH, 150);

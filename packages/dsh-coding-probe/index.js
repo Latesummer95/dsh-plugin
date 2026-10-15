@@ -41,7 +41,7 @@
  * @module dsh-coding-probe
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -320,28 +320,132 @@ function extractCode(text) {
 }
 
 /**
+ * How long to wait, after the timeout has fired, before giving up on the
+ * process actually dying.
+ *
+ * The exit has to be observed rather than assumed: the temporary directory is
+ * removed as soon as this resolves, and a program that is still running would
+ * have its own source file deleted underneath it mid-write, turning a clean
+ * timeout into a confusing partial failure.
+ */
+const KILL_GRACE_MS = 2000;
+
+/**
+ * Run a child process asynchronously and capture its output.
+ *
+ * This is deliberately NOT `spawnSync`. A synchronous spawn blocks the entire
+ * host event loop for the life of the child, and this battery spawns one child
+ * per generation — a Node program (up to {@link DEFAULTS.execTimeoutMs}) or
+ * headless Chrome (up to {@link DEFAULTS.renderTimeoutMs}) — repeated across
+ * every probe and every model. Synchronously, that froze the DSH host for the
+ * whole detection: the GUI stopped responding and every streaming conversation
+ * stalled, on every single run. Async keeps the host serving while a probe
+ * waits.
+ *
+ * @param command - the executable.
+ * @param args - its arguments.
+ * @param options - `{cwd, env, timeoutMs, maxBuffer}`.
+ * @returns a promise of `{stdout, stderr, status, timedOut}`; `status` is
+ *   `null` when the process never exited normally, and `stdout`/`stderr` are
+ *   `null` when the output exceeded `maxBuffer`.
+ */
+function runProcess(command, args, options = {}) {
+	return new Promise((resolve) => {
+		const child = spawn(command, args, {
+			cwd: options.cwd,
+			env: options.env,
+			stdio: ["ignore", "pipe", "pipe"],
+			// Detach so the child gets its own process group. Killing a process
+			// group reaches the grandchildren too: a timed-out Chrome leaves a
+			// dozen renderer/zygote processes behind if only the direct child is
+			// signalled, and a leaked browser per probe adds up fast.
+			detached: process.platform !== "win32"
+		});
+		const stdout = [];
+		const stderr = [];
+		let stdoutBytes = 0;
+		let stderrBytes = 0;
+		let timedOut = false;
+		let settled = false;
+		let killTimer;
+		const limit = options.maxBuffer ?? 8 * 1024 * 1024;
+		const timer = setTimeout(() => {
+			timedOut = true;
+			killProcess(child, "SIGKILL");
+			// The `close` handler is what usually resolves this, but it is not
+			// guaranteed to arrive (a child wedged in an uninterruptible wait
+			// never gets reaped), so a late timer settles the promise anyway. A
+			// leaked child is survivable; a probe stuck forever is not.
+			killTimer = setTimeout(() => finish(null, null), KILL_GRACE_MS);
+		}, Math.max(1, Number(options.timeoutMs) || 1));
+
+		/** Signal the child, and its whole group where the platform has one. */
+		function killProcess(target, signal) {
+			try {
+				if (process.platform !== "win32" && target.pid !== undefined) process.kill(-target.pid, signal);
+				else target.kill(signal);
+			} catch {
+				// The group is gone or was never created; the direct child may
+				// still be alive, so try it before giving up.
+				try {
+					target.kill(signal);
+				} catch {
+					// Already dead. Nothing left to kill.
+				}
+			}
+		}
+
+		/** Settle once, keeping whatever output arrived before the kill. */
+		function finish(status, signal) {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			clearTimeout(killTimer);
+			resolve({
+				stdout: stdoutBytes > limit ? null : Buffer.concat(stdout).toString("utf8"),
+				stderr: stderrBytes > limit ? null : Buffer.concat(stderr).toString("utf8"),
+				status,
+				// Mirrors the spawnSync semantics this replaced: a timeout and a
+				// SIGTERM from outside are both "did not finish on its own". The
+				// negative status is how a signal death is reported, and
+				// maxBuffer reports a null stream.
+				timedOut: timedOut || signal === "SIGTERM" || (status !== null && status < 0)
+					|| stdoutBytes > limit || stderrBytes > limit
+			});
+		}
+
+		// A missing executable (no Chrome installed) emits `error` and no
+		// `close`, so without this the probe would hang instead of reporting the
+		// failure as evidence.
+		child.on("error", () => finish(null, null));
+		child.stdout?.on("data", (chunk) => { stdoutBytes += chunk.length; stdout.push(chunk); });
+		child.stderr?.on("data", (chunk) => { stderrBytes += chunk.length; stderr.push(chunk); });
+		child.on("close", (status, signal) => finish(status, signal));
+	});
+}
+
+/**
  * Run a generated Node.js program and capture its output.
  *
  * @param code - the program source.
  * @param config - the resolved plugin config.
- * @returns `{stdout, stderr, status, timedOut}`.
+ * @returns a promise of `{stdout, stderr, status, timedOut}`.
  */
-function runNode(code, config) {
+async function runNode(code, config) {
 	const dir = mkdtempSync(join(tmpdir(), "coding-probe-"));
 	try {
 		const file = join(dir, "program.mjs");
 		writeFileSync(file, code, "utf8");
-		const result = spawnSync(process.execPath, [file], {
+		const result = await runProcess(process.execPath, [file], {
 			cwd: dir,
-			timeout: config.execTimeoutMs,
-			encoding: "utf8",
+			timeoutMs: config.execTimeoutMs,
 			env: { PATH: process.env.PATH, HOME: process.env.HOME, NODE_OPTIONS: "" }
 		});
 		return {
 			stdout: result.stdout ?? "",
 			stderr: result.stderr ?? "",
 			status: result.status,
-			timedOut: result.error?.code === "ETIMEDOUT" || result.signal === "SIGTERM"
+			timedOut: result.timedOut
 		};
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
@@ -490,14 +594,15 @@ ${html}
  * @param html - the model's HTML.
  * @param config - the resolved plugin config.
  * @param measure - whether to measure pixels.
- * @returns the measurement, including any uncaught error and console failures.
+ * @returns a promise of the measurement, including any uncaught error and
+ *   console failures.
  */
-function measureRender(html, config, measure = true) {
+async function measureRender(html, config, measure = true) {
 	const dir = mkdtempSync(join(tmpdir(), "coding-probe-"));
 	try {
 		const file = join(dir, "page.html");
 		writeFileSync(file, instrument(html, measure, config.sampleDelayMs), "utf8");
-		const result = spawnSync(config.chromePath, [
+		const result = await runProcess(config.chromePath, [
 			...CHROME_FLAGS,
 			`--user-data-dir=${join(dir, "profile")}`,
 			`--virtual-time-budget=${Math.max(4000, Number(config.sampleDelayMs) + 3000)}`,
@@ -505,7 +610,7 @@ function measureRender(html, config, measure = true) {
 			"--v=0",
 			"--dump-dom",
 			`file://${file}`
-		], { timeout: config.renderTimeoutMs, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+		], { timeoutMs: config.renderTimeoutMs, maxBuffer: 64 * 1024 * 1024 });
 		const dom = result.stdout ?? "";
 		const stderr = result.stderr ?? "";
 		// The title is HTML-escaped by --dump-dom, so unescape before parsing.
@@ -548,13 +653,13 @@ function measureRender(html, config, measure = true) {
  * @param probe - the probe definition.
  * @param reply - the model's raw reply.
  * @param config - the resolved plugin config.
- * @returns the grading outcome plus raw evidence.
+ * @returns a promise of the grading outcome plus raw evidence.
  */
-function execute(probe, reply, config) {
+async function execute(probe, reply, config) {
 	const code = extractCode(reply);
 	if (code.length === 0) return { ok: false, detail: "空回复", evidence: {} };
 	if (probe.kind === "node") {
-		const evidence = runNode(code, config);
+		const evidence = await runNode(code, config);
 		let graded;
 		try {
 			graded = probe.check(evidence);
@@ -571,7 +676,7 @@ function execute(probe, reply, config) {
 			}
 		};
 	}
-	const evidence = measureRender(code, config, true);
+	const evidence = await measureRender(code, config, true);
 	let graded;
 	try {
 		graded = probe.check(evidence);
@@ -784,10 +889,33 @@ async function listCandidates(ctx) {
 }
 
 /**
- * Collect a bounded request body as UTF-8 text.
+ * Refuse an oversized body with the status the route must answer.
+ *
+ * The status rides on the error rather than being sniffed from its message:
+ * the route has to tell "too large" (413) apart from an unreadable request
+ * (400), and matching on the message would break the moment the wording
+ * changed.
+ *
+ * @returns the error to throw.
+ */
+function bodyTooLarge() {
+	const error = new Error("请求体过大");
+	error.status = 413;
+	return error;
+}
+
+/**
+ * Read a request body, bounded so a malformed client cannot exhaust memory.
+ *
+ * The limit is enforced by throwing rather than by returning an empty body:
+ * silently substituting `{}` turns "the client sent something we refuse to
+ * read" into "the client sent no selection", and the route then runs the whole
+ * battery — the most expensive possible response to a request it just
+ * rejected.
  *
  * @param req - the incoming request.
- * @returns the body text, or `""` when absent/oversized.
+ * @returns the body text.
+ * @throws when the body exceeds the limit.
  */
 async function readBody(req) {
 	const chunks = [];
@@ -795,8 +923,11 @@ async function readBody(req) {
 	for await (const chunk of req) {
 		size += chunk.byteLength;
 		if (size > 1024 * 1024) {
+			// Drain what is left before throwing: the connection service reuses
+			// keep-alive sockets, and a body left unread would be parsed as the
+			// head of the next request on that socket.
 			req.resume();
-			return "";
+			throw bodyTooLarge();
 		}
 		chunks.push(chunk);
 	}
@@ -811,8 +942,9 @@ async function readBody(req) {
  * twice would silently lose whichever field came second.
  *
  * @param req - the incoming request.
- * @returns the parsed object, or `{}` when the body is absent, oversized, or
- *   not a JSON object.
+ * @returns the parsed object, or `{}` when the body is absent or not a JSON
+ *   object.
+ * @throws when the body exceeds the size limit.
  */
 async function readRequest(req) {
 	const text = await readBody(req);
@@ -949,7 +1081,7 @@ async function runSingle(ctx, target, probe, config) {
 			ms: generated.ms
 		};
 	}
-	const graded = execute(probe, generated.text, config);
+	const graded = await execute(probe, generated.text, config);
 	return {
 		id: probe.id,
 		label: probe.label,
@@ -1009,7 +1141,7 @@ async function runRepeated(ctx, target, probe, config) {
 			const message = generated.error ?? "空回复";
 			trials.push({ attempt: i, generated: false, error: message, cause: classifyFailure(message), ms: generated.ms });
 		} else {
-			const graded = execute(probe, generated.text, config);
+			const graded = await execute(probe, generated.text, config);
 			trials.push({
 				attempt: i,
 				generated: true,
@@ -1254,17 +1386,67 @@ function apply(ctx, config = {}) {
 				res.end();
 				return;
 			}
+			// GET is the inspection endpoint: it reports the current job's state,
+			// or what WOULD run when nothing has run yet, and always returns
+			// immediately. Running the battery here would make a plain curl hang
+			// for many minutes and look like a broken route.
+			//
+			// Discovery is attempted even though it can fail, because the idle
+			// manifest's whole value is naming the models a POST would probe. A
+			// failure must not become a 5xx, though: the panel reads a failed GET
+			// as a transport error and clears the report it is holding, so an
+			// edited profile or a blipped provider would erase a running job's
+			// progress from the UI while the job was still alive. So the throw is
+			// caught and reported inside a 200 — the panel shows "could not
+			// resolve" instead of losing its report.
+			if (req.method === "GET") {
+				const job = runs.current();
+				if (job === null) {
+					let targets = [];
+					let unresolved;
+					try {
+						targets = (await resolveTargets(ctx, cfg)).map((t) => `${t.provider}/${t.model}`);
+					} catch (error) {
+						unresolved = error instanceof Error ? error.message : String(error);
+					}
+					sendJson(res, 200, {
+						phase: "idle",
+						probes: describeProbes(PROBES),
+						targets,
+						...(unresolved === undefined ? {} : { unresolved })
+					});
+					return;
+				}
+				sendJson(res, 200, {
+					phase: job.phase,
+					id: job.id,
+					startedAt: job.startedAt,
+					finishedAt: job.finishedAt,
+					error: job.error,
+					...job.report
+				});
+				return;
+			}
 			// POST may carry an explicit model and probe selection; GET never
 			// does. The body is read exactly once — see {@link readRequest}.
-			const body = req.method === "POST" ? await readRequest(req) : {};
-			const requested = req.method === "POST" ? selectionFrom(body) : undefined;
-			if (req.method === "POST" && Array.isArray(body.probes) && probesFrom(body).length === 0) {
+			let body;
+			try {
+				body = await readRequest(req);
+			} catch (error) {
+				// An oversized body is refused, never silently read as "no
+				// selection": that fallback would run the entire expensive
+				// battery in response to a request the route just rejected.
+				sendJson(res, error?.status ?? 400, { error: error instanceof Error ? error.message : String(error) });
+				return;
+			}
+			const requested = selectionFrom(body);
+			if (Array.isArray(body.probes) && probesFrom(body).length === 0) {
 				// An explicit empty selection is a client bug, not a request to
 				// run the whole (expensive) battery.
 				sendJson(res, 400, { error: "请至少选择一项检测内容" });
 				return;
 			}
-			const probes = req.method === "POST" ? resolveProbes(probesFrom(body)) : [...PROBES];
+			const probes = resolveProbes(probesFrom(body));
 			let targets;
 			try {
 				targets = await resolveTargets(ctx, cfg, requested);
@@ -1281,26 +1463,6 @@ function apply(ctx, config = {}) {
 				probes: describeProbes(probes),
 				targets: targets.map((t) => `${t.provider}/${t.model}`)
 			};
-			// GET is the inspection endpoint: it reports the current job's state,
-			// or what WOULD run when nothing has run yet, and always returns
-			// immediately. Running the battery here would make a plain curl hang
-			// for many minutes and look like a broken route.
-			if (req.method === "GET") {
-				const job = runs.current();
-				if (job === null) {
-					sendJson(res, 200, { phase: "idle", ...manifest });
-					return;
-				}
-				sendJson(res, 200, {
-					phase: job.phase,
-					id: job.id,
-					startedAt: job.startedAt,
-					finishedAt: job.finishedAt,
-					error: job.error,
-					...(job.report ?? manifest)
-				});
-				return;
-			}
 			// POST starts the job and returns at once. The panel polls GET, so
 			// navigating away mid-run no longer throws the work away.
 			const { job, done } = runs.start(manifest, (live) => runBattery(ctx, targets, probes, cfg, live));
@@ -1403,6 +1565,7 @@ export {
 	resolveProbes,
 	resolveTargets,
 	runNode,
+	runProcess,
 	score,
 	selectionFrom
 };

@@ -548,20 +548,23 @@ window.__ModuleLoader__.load({
 		 *
 		 * @param ctx - the client root context.
 		 */
-		function apply(ctx) {
-			ctx.slots.inject("main", () => ctx.slots.register({ name: "main", key: PANEL_ID }, ProbePanel));
-			// Under the merged `dsh-probe` panel this half is a tab, not a rail
-			// button: the merged panel owns the single entry. Registering one here
-			// too would leave the user with three entries for two probes.
-			if (typeof window === "undefined" || window.__DSH_PROBE_MERGED__ !== true) {
-				ctx.slots.inject("sidebar.panellist", () => ctx.slots.register({
-					name: "sidebar.panellist",
-					id: PANEL_ID,
-					order: 41,
-					label: () => "编码能力检测"
-				}, ProbeIcon));
-			}
-		}
+		/**
+		 * Register nothing.
+		 *
+		 * This half is only ever mounted as a tab of the merged `dsh-probe` panel:
+		 * it ships no `dsh.bundle` and is absent from the profile's bundle list, so
+		 * the merged panel's patch is the only thing that loads it. The panel owns
+		 * the rail entry and the `main` seat; a half claiming either would put a
+		 * second, unreachable button in the sidebar.
+		 *
+		 * An earlier version tried to detect that with a `window.__DSH_PROBE_MERGED__`
+		 * flag set by the panel's bundle. It could not work: the panel *requires*
+		 * this bundle, so the module graph places this bundle first, and this `apply`
+		 * runs before the flag is ever assigned. The flag was therefore always
+		 * `undefined` here and the guard never fired. Owning nothing is the fix that
+		 * does not depend on load order.
+		 */
+		function apply(_ctx) {}
 
 		Object.assign(module.exports, { ModelPicker, PANEL_ID, ProbePanel, ProbePicker, apply, inject });
 		return module.exports;

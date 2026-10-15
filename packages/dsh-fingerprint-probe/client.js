@@ -620,20 +620,15 @@ window.__ModuleLoader__.load({
 		 *
 		 * @param ctx - the client root context.
 		 */
-		function apply(ctx) {
-			ctx.slots.inject("main", () => ctx.slots.register({ name: "main", key: PANEL_ID }, FingerprintPanel));
-			// Under the merged `dsh-probe` panel this half is a tab, not a rail
-			// button: the merged panel owns the single entry. Registering one here
-			// too would leave the user with three entries for two probes.
-			if (typeof window === "undefined" || window.__DSH_PROBE_MERGED__ !== true) {
-				ctx.slots.inject("sidebar.panellist", () => ctx.slots.register({
-					name: "sidebar.panellist",
-					id: PANEL_ID,
-					order: 42,
-					label: () => "模型指纹检测"
-				}, FingerprintIcon));
-			}
-		}
+		/**
+		 * Register nothing.
+		 *
+		 * See the same note in `dsh-coding-probe/client.js`: this half is only ever a
+		 * tab of the merged panel, and the `window.__DSH_PROBE_MERGED__` guard it used
+		 * to rely on could never be true, because the panel requires this bundle and
+		 * therefore loads after it.
+		 */
+		function apply(_ctx) {}
 
 		Object.assign(module.exports, { AttemptRow, FingerprintPanel, LanguagePicker, ModelPicker, PANEL_ID, apply, inject });
 		return module.exports;

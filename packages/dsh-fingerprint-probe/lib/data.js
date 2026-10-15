@@ -25,7 +25,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -154,12 +154,43 @@ export async function loadReference(options = {}) {
 	return { detector, bank, upstream: UPSTREAM };
 }
 
+/**
+ * The last verified answer, keyed by the file's identity.
+ *
+ * `cacheStatus` reads and hashes a ~4 MiB file, and the panel calls the route
+ * that reports it every few seconds. Hashing on each poll is pure waste — the
+ * detector only changes when something replaces the file — so the result is
+ * reused until the file's size or mtime says otherwise.
+ *
+ * Keying on `mtimeMs + size` (rather than caching unconditionally) is what makes
+ * this safe: an external re-download or a manual copy invalidates it, and a
+ * stale "cached: true" would otherwise let the panel promise a verified detector
+ * it no longer has. A same-size, same-mtime replacement is the one case this
+ * cannot see, and it is not reachable without deliberately forging a timestamp.
+ */
+let cacheStatusMemo = null;
+
+/** Drop the memoized answer. Exported for tests and for a forced re-check. */
+export function resetCacheStatus() {
+	cacheStatusMemo = null;
+}
+
 /** Whether a verified detector is already cached, so the panel can say so up front. */
 export function cacheStatus() {
 	const path = detectorPath();
-	if (!existsSync(path)) return { cached: false, path, bytes: 0 };
+	if (!existsSync(path)) {
+		cacheStatusMemo = null;
+		return { cached: false, path, bytes: 0 };
+	}
+	const stat = statSync(path);
+	const key = `${stat.size}:${stat.mtimeMs}`;
+	if (cacheStatusMemo !== null && cacheStatusMemo.path === path && cacheStatusMemo.key === key) {
+		return cacheStatusMemo.value;
+	}
 	const bytes = new Uint8Array(readFileSync(path));
-	return { cached: sha256(bytes) === UPSTREAM.detectorSha256, path, bytes: bytes.length };
+	const value = { cached: sha256(bytes) === UPSTREAM.detectorSha256, path, bytes: bytes.length };
+	cacheStatusMemo = { path, key, value };
+	return value;
 }
 
 export { detectorPath, sha256 };

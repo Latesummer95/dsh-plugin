@@ -1,0 +1,29 @@
+{
+  "name": "dsh-level-probe",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "Probe whether a route's advertised thinking levels actually do anything: asks the same question at every level and compares reasoning tokens, latency and accuracy",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node test/test-levels.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
