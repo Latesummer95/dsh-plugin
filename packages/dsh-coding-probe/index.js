@@ -963,6 +963,26 @@ async function readRequest(req) {
  * @param body - the parsed POST body.
  * @returns the selection, or `undefined` to fall back to the configured targets.
  */
+/**
+ * Reject a request body carrying keys this route does not read.
+ *
+ * An ignored key is the expensive kind of mistake. A caller who sends
+ * `{ provider, model }` — the shape the *config* uses — gets no error: the route
+ * finds no `models`, falls back to the configured targets, and launches a full
+ * battery against a different set of models. That is several minutes of work
+ * producing an answer to a question nobody asked, and nothing in the response
+ * says so. Naming the accepted keys turns it into an immediate 400.
+ *
+ * @param body - the parsed POST body.
+ * @param allowed - the keys this route reads.
+ * @returns an error message, or `undefined` when the body is acceptable.
+ */
+function unknownKeys(body, allowed) {
+	const extra = Object.keys(body ?? {}).filter((key) => !allowed.includes(key));
+	if (extra.length === 0) return undefined;
+	return `不认识的请求字段：${extra.join(", ")}；本接口只接受 ${allowed.join(", ")}`;
+}
+
 function selectionFrom(body) {
 	const raw = body?.models ?? body?.targets;
 	if (!Array.isArray(raw)) return undefined;
@@ -1437,6 +1457,11 @@ function apply(ctx, config = {}) {
 				// selection": that fallback would run the entire expensive
 				// battery in response to a request the route just rejected.
 				sendJson(res, error?.status ?? 400, { error: error instanceof Error ? error.message : String(error) });
+				return;
+			}
+			const stray = unknownKeys(body, ["models", "targets", "probes"]);
+			if (stray !== undefined) {
+				sendJson(res, 400, { error: stray });
 				return;
 			}
 			const requested = selectionFrom(body);

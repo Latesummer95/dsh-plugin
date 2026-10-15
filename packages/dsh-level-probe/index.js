@@ -607,6 +607,26 @@ export async function listCandidates(ctx) {
  * ------------------------------------------------------------------ */
 
 /** Parse a `provider/model` list, or `null` when the shape is wrong. */
+/**
+ * Reject a request body carrying keys this route does not read.
+ *
+ * An ignored key is the expensive kind of mistake. A caller who sends
+ * `{ provider, model }` — the shape the *config* uses — gets no error: the route
+ * finds no `models`, falls back to the configured targets, and launches a full
+ * battery against a different set of models. That is several minutes of work
+ * producing an answer to a question nobody asked, and nothing in the response
+ * says so. Naming the accepted keys turns it into an immediate 400.
+ *
+ * @param body - the parsed POST body.
+ * @param allowed - the keys this route reads.
+ * @returns an error message, or `undefined` when the body is acceptable.
+ */
+export function unknownKeys(body, allowed) {
+	const extra = Object.keys(body ?? {}).filter((key) => !allowed.includes(key));
+	if (extra.length === 0) return undefined;
+	return `不认识的请求字段：${extra.join(", ")}；本接口只接受 ${allowed.join(", ")}`;
+}
+
 export function parseModels(value) {
 	if (!Array.isArray(value)) return value === undefined ? undefined : null;
 	const out = [];
@@ -870,6 +890,11 @@ export function apply(ctx, config = {}) {
 					body = raw.trim().length === 0 ? {} : JSON.parse(raw);
 				} catch (error) {
 					sendJson(res, 400, { error: `无法解析请求体：${error instanceof Error ? error.message : String(error)}` });
+					return;
+				}
+				const stray = unknownKeys(body, ["models", "seed"]);
+				if (stray !== undefined) {
+					sendJson(res, 400, { error: stray });
 					return;
 				}
 				const requested = parseModels(body.models);

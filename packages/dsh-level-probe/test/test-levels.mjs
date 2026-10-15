@@ -35,7 +35,8 @@ import {
 	parseModels,
 	probeModel,
 	recommend,
-	summarizeLevel
+	summarizeLevel,
+	unknownKeys
 } from "../index.js";
 
 let passed = 0;
@@ -630,6 +631,31 @@ await test("a second run supersedes the first", () => {
 });
 
 /* ------------------------------------------------------------------ */
+
+await test("未声明的字段被拒绝", () => {
+	// A caller who sends the *config* shape — { provider, model } — must get an
+	// error, not a silent run against the configured defaults. Ignoring the key
+	// launched a full battery on the wrong models and said nothing.
+	assert.equal(typeof unknownKeys({ provider: "a1", model: "x" }, ["models", "seed"]), "string");
+});
+
+await test("拒绝信息里点名了字段并说明接受什么", () => {
+	const message = unknownKeys({ provider: "a1" }, ["models", "seed"]);
+	assert.ok(message.includes("provider"), `应点名 provider：${message}`);
+	assert.ok(message.includes("models"), `应说明接受 models：${message}`);
+});
+
+await test("全部合法字段通过", () => {
+	equal("models + seed", unknownKeys({ models: ["a1/x"], seed: 7 }, ["models", "seed"]), undefined);
+	equal("空请求体", unknownKeys({}, ["models", "seed"]), undefined);
+	// `null` is not a plain object but must not throw on the way to being ignored.
+	equal("null 请求体", unknownKeys(null, ["models", "seed"]), undefined);
+});
+
+await test("多余的字段被逐个列出", () => {
+	const message = unknownKeys({ a: 1, b: 2 }, ["c"]);
+	assert.ok(message.includes("a") && message.includes("b"), `应列出所有多余字段：${message}`);
+});
 
 console.log("");
 if (failed > 0) {
