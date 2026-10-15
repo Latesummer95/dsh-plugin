@@ -17,7 +17,7 @@
  */
 
 import { createRequire } from "node:module";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -72,6 +72,21 @@ function findDshRoot() {
     }
   }
 
+  // The node running this test resolves global packages from its own prefix, and
+  // walking up from the repo never reaches it: DSH lives under
+  // `~/.nvm/versions/node/<v>/lib/node_modules`, a sibling of the repo rather
+  // than an ancestor. Without this candidate the integration layer — the only
+  // part that asks the real adapter what the picker will show — silently skips
+  // on exactly the machines that have DSH installed, which is how a
+  // seven-vs-five-tier difference stayed invisible.
+  // Candidates are the `@deepseek-ai/dsh` package directory, because the probe
+  // below looks for `node_modules/@deepseek-ai/dsh-llm-pi-ai` *inside* it.
+  const globalModules = join(dirname(process.execPath), "..", "lib", "node_modules");
+  candidates.push(join(globalModules, "@deepseek-ai", "dsh"));
+  if (process.env.npm_config_prefix) {
+    candidates.push(join(process.env.npm_config_prefix, "lib", "node_modules", "@deepseek-ai", "dsh"));
+  }
+
   // The usual global install location for the running node.
   const require = createRequire(import.meta.url);
   try {
@@ -112,15 +127,18 @@ check("正则元字符不会误伤", !isAdaptiveModel("claude-opus-5X", ADAPTIVE
 
 // The default block must NOT declare `off`.
 const defaultEfforts = buildEfforts(normalizeConfig({}));
-check("默认不含 off", !("off" in defaultEfforts), JSON.stringify(defaultEfforts));
-equal("默认档位", defaultEfforts, { low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
+// The picker shows seven tiers, so `off` is part of the default rather than an
+// opt-in: a model with six levels and no way to say "don't think" is missing the
+// one setting a user reaches for when reasoning is wasting time.
+check("默认含 off", "off" in defaultEfforts && defaultEfforts.off === null, JSON.stringify(defaultEfforts));
+equal("默认档位", defaultEfforts, { off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
 
 const withOff = buildEfforts(normalizeConfig({ includeOff: true }));
 check("includeOff 时写入 off: null", "off" in withOff && withOff.off === null, JSON.stringify(withOff));
 
 // Levels the runtime would reject must be dropped rather than forwarded.
 const filtered = buildEfforts(normalizeConfig({ levels: { off: null, low: "low", high: "", max: null } }));
-equal("空串与 null 档位被剔除", filtered, { low: "low" });
+equal("空串与 null 档位被剔除", filtered, { off: null, low: "low" });
 
 // Config defaults.
 const defaults = normalizeConfig(undefined);
@@ -153,7 +171,7 @@ const out = augmentProviders(RAW, settings, report);
 const byId = Object.fromEntries(out.providers.cloud.models.map((m) => [m.id, m]));
 
 equal("anthropic 模型拿到档位", byId["claude-opus-5"].reasoningEfforts,
-  { low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
+  { off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" });
 check("adaptive 模型带上 forceAdaptiveThinking",
   byId["claude-opus-5"].compat?.forceAdaptiveThinking === true);
 check("budget 模型不写 forceAdaptiveThinking",
@@ -280,18 +298,23 @@ if (!DSH) {
   await loader.await();
   await sleep(1000);
 
-  equal("生效：claude-opus-5 拿到五档",
-    await levelsOf("cloud", "claude-opus-5"), ["low", "medium", "high", "xhigh", "max"]);
-  equal("生效：claude-haiku-4-5 同样拿到五档",
-    await levelsOf("cloud", "claude-haiku-4-5"), ["low", "medium", "high", "xhigh", "max"]);
+  // The real adapter is the authority here: this asserts what
+  // `dsh-llm-pi-ai` actually reports for the picker, not what the plugin put in
+  // some intermediate object. Seven tiers on an Anthropic route.
+  equal("生效：claude-opus-5 拿到完整七档",
+    await levelsOf("cloud", "claude-opus-5"), ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+  equal("生效：claude-haiku-4-5 同样拿到完整七档",
+    await levelsOf("cloud", "claude-haiku-4-5"), ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
-  // `off` must not be selectable: omitting it is what makes pi-ai send no
-  // thinking field at all, which is the only shape adaptive models accept.
+  // `off` is selectable by design: it is the one setting that stops a model
+  // thinking, and a picker without it leaves no way to turn reasoning back off.
   const opusLevels = await levelsOf("cloud", "claude-opus-5");
-  check("off 不出现在可选档位里", !opusLevels.includes("off"), opusLevels.join(","));
+  check("off 出现在可选档位里", opusLevels.includes("off"), opusLevels.join(","));
 
-  // A non-anthropic route must be untouched — that is the whole safety property.
-  equal("非 anthropic 路由未被动过", await levelsOf("a1", "deepseek-v4.1-flash"), null);
+  // The point of the whole change: a non-anthropic route gets the same seven,
+  // because `reasoningEfforts` is a DSH-level field the adapter maps for any API.
+  equal("非 anthropic 路由同样拿到完整七档",
+    await levelsOf("a1", "deepseek-v4.1-flash"), ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
   // The profile's raw config must still be pristine: the plugin works in memory.
   const entry = [...loader.entries()].find((e) => e.options?.id === "llm-pi-ai");
@@ -322,7 +345,7 @@ if (!DSH) {
   await loader.await();
   await sleep(800);
   equal("普通配置变更后档位仍在", await levelsOf("cloud", "claude-opus-5"),
-    ["low", "medium", "high", "xhigh", "max"]);
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 }
 
 /* ------------------------------------------------------------------ *
@@ -349,13 +372,16 @@ console.log("跨 API 覆盖");
 
   check("openai-responses 路由也拿到档位", relay.m1.reasoningEfforts !== undefined,
     JSON.stringify(relay.m1.reasoningEfforts));
-  // xhigh/max are not in the openai reasoning vocabulary: offering them would put
-  // a level in the selector that fails every request.
-  check("openai-responses 只拿三档可移植档位",
-    JSON.stringify(relay.m1.reasoningEfforts) === JSON.stringify({ low: "low", medium: "medium", high: "high" }),
+  // Every route gets the whole vocabulary. Restricting a route to a subset made
+  // the picker shorter on exactly the routes the user was trying to fill in, and
+  // the "openai would reject xhigh/max" premise was wrong: pi-ai clamps an
+  // unavailable level to the nearest available one instead of failing.
+  check("openai-responses 同样拿到完整七档",
+    Object.keys(relay.m1.reasoningEfforts).length === 7,
     JSON.stringify(relay.m1.reasoningEfforts));
-  check("openai-responses 不含 xhigh/max",
-    relay.m1.reasoningEfforts.xhigh === undefined && relay.m1.reasoningEfforts.max === undefined);
+  check("openai-responses 含 xhigh/max",
+    relay.m1.reasoningEfforts.xhigh === "xhigh" && relay.m1.reasoningEfforts.max === "max",
+    JSON.stringify(relay.m1.reasoningEfforts));
   check("anthropic 路由保留五档",
     out.providers.cloud.models[0].reasoningEfforts.max === "max");
   check("非推理模型在非 anthropic 路由同样跳过", relay.m2.reasoningEfforts === false);
@@ -367,7 +393,7 @@ console.log("跨 API 覆盖");
     { models: [], adaptive: [] },
   );
   check("显式 levels 覆盖 API 默认",
-    JSON.stringify(custom.providers.relay.models[0].reasoningEfforts) === JSON.stringify({ low: "lo", max: "ultra" }),
+    JSON.stringify(custom.providers.relay.models[0].reasoningEfforts) === JSON.stringify({ off: null, low: "lo", max: "ultra" }),
     JSON.stringify(custom.providers.relay.models[0].reasoningEfforts));
 }
 
@@ -438,7 +464,51 @@ const ROUTED = { providers: { cloud: ROUTE } };
   // An empty levels block must not clone-and-return an unchanged config, which
   // would churn the volatile ref on every resolution.
   const settings = normalizeConfig({ levels: {} });
-  equal("levels 为空时退回默认档位", Object.keys(settings.levels).length, 5);
+  equal("levels 为空时退回默认档位", Object.keys(settings.levels).length, 6);
+}
+
+console.log("开关文案与实现一致");
+
+// The row's description and the host half drifted apart once: the code was
+// widened to every route but the copy still said "Anthropic 路由的每个模型", so a
+// fixed plugin read as broken. Loading the real bundle (rather than grepping the
+// source) keeps this pinned to the string the user actually sees.
+{
+  const bundlePath = new URL("../client.js", import.meta.url);
+  const source = readFileSync(bundlePath, "utf8");
+  let registered = null;
+  const fakeWindow = {
+    __ModuleLoader__: { load: (entry) => { registered = entry; } },
+  };
+  const fakeRequire = (name) => {
+    if (name === "react") {
+      return { createElement: () => null, useReducer: () => [0, () => {}], useEffect: () => {}, useState: () => [false, () => {}] };
+    }
+    return {
+      Switch: () => null,
+      IconGaugeOutlineRegular: () => null,
+      createSnapshot: () => ({}),
+    };
+  };
+  new Function("window", "require", source)(fakeWindow, fakeRequire);
+
+  check("bundle 注册了自己", registered !== null && registered.id === "dsh-thinking-effort",
+    JSON.stringify(registered?.id ?? null));
+  const copy = registered.factory(fakeRequire).COPY;
+
+  check("文案不再声称只作用于 Anthropic 路由",
+    !/Anthropic 路由的每个模型/.test(copy.description), copy.description);
+  check("文案说明了作用于所有路由",
+    /所有路由/.test(copy.description), copy.description);
+  // One full set for every route. The copy and the code disagreeing here is
+  // exactly the bug this section exists to catch: a reader who sees "Anthropic
+  // 路由" concludes the plugin is still Anthropic-only.
+  check("文案说明是完整七档",
+    /七档/.test(copy.description) && /off \/ minimal \/ low \/ medium \/ high \/ xhigh \/ max/.test(copy.description),
+    copy.description);
+  check("文案说明已声明档位的模型保持不动",
+    /保持不动/.test(copy.description), copy.description);
+  check("标题未变", copy.title === "启用思考强度", copy.title);
 }
 
 console.log("");

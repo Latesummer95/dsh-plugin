@@ -117,7 +117,12 @@ window.__ModuleLoader__.load({
 		 */
 		const COPY = {
 			title: "启用思考强度",
-			description: "打开后，Anthropic 路由的每个模型都会在设置里出现思考档位选择器（low / medium / high / xhigh / max），并对支持自适应思考的模型补上兼容标记。关闭后恢复为 profile 里自己写的配置。"
+			// Describes every route, because that is what the host half does: the
+			// only guard left is "the route names an api", and gating on
+			// `anthropic-messages` was the bug this replaced. The earlier copy said
+			// "Anthropic 路由的每个模型", which described the old behaviour and made a
+			// fixed plugin look unfixed.
+			description: "打开后，所有路由（不只 Anthropic）里每个模型的模型选择器都会出现完整七档思考档位：off / minimal / low / medium / high / xhigh / max。已经在 profile 里自己写了 reasoningEfforts 的模型保持不动，标了不推理的模型跳过。关闭后恢复为 profile 里自己写的配置。"
 		};
 
 		/** Required services: the slot registry and the settings transport. */

@@ -104,7 +104,7 @@ export const inject = ["loader"];
  */
 export const Config = z.object({
   enabled: z.boolean().default(true).volatile(),
-  includeOff: z.boolean().default(false).volatile(),
+  includeOff: z.boolean().default(true).volatile(),
   overwrite: z.boolean().default(false).volatile(),
   adaptiveCompat: z.boolean().default(true).volatile(),
 });
@@ -129,40 +129,27 @@ const ADAPTIVE_MODELS = [
   "claude-sonnet-5",
 ];
 
-/** Levels offered when the profile does not say otherwise. `off` is absent on purpose. */
+/**
+ * Levels offered when the profile does not say otherwise.
+ *
+ * The whole DSH vocabulary except `off`, and the same set for every route: the
+ * picker is built from the adapter's `thinkingLevelMap`, which is derived from
+ * these keys, so a route restricted to a subset would show a subset. The
+ * earlier split — five levels for Anthropic, three for everyone else — was
+ * justified by "an openai-responses route would reject xhigh/max", but that is
+ * not what happens: `clampThinkingLevel` walks to the nearest *available* level
+ * rather than failing, and a level a route cannot express is better clamped than
+ * absent. Six here plus `off` (carried by `includeOff`, since `off` is the
+ * absence of a wire value rather than one) is the seven the picker shows.
+ */
 const DEFAULT_LEVELS = {
+  minimal: "minimal",
   low: "low",
   medium: "medium",
   high: "high",
   xhigh: "xhigh",
   max: "max",
 };
-
-/**
- * Defaults for routes that do not speak `anthropic-messages`.
- *
- * The five Anthropic levels are not a portable vocabulary. An `openai-responses`
- * route rejects `xhigh` and `max` at request time, so offering them there would
- * put a level in the selector that fails every time it is chosen — worse than not
- * offering it. `low`/`medium`/`high` are the intersection every reasoning API in
- * pi-ai accepts, and a profile that wants more (the `a1` route spells its top
- * level `ultra`) declares its own `reasoningEfforts` or overrides `levels`.
- */
-const PORTABLE_LEVELS = {
-  low: "low",
-  medium: "medium",
-  high: "high",
-};
-
-/**
- * The default level set for one route.
- *
- * @param route - the route being augmented.
- * @returns the levels to offer when the profile named none.
- */
-function defaultLevelsFor(route) {
-  return route?.api === "anthropic-messages" ? DEFAULT_LEVELS : PORTABLE_LEVELS;
-}
 
 /**
  * Does this id name one of the adaptive models?
@@ -196,7 +183,7 @@ export function normalizeConfig(config) {
     enabled: source.enabled === undefined ? true : Boolean(source.enabled),
     levels,
     levelsExplicit,
-    includeOff: source.includeOff === true,
+    includeOff: source.includeOff === undefined ? true : Boolean(source.includeOff),
     overwrite: source.overwrite === true,
     adaptiveCompat: source.adaptiveCompat !== false,
     adaptiveModels: Array.isArray(source.adaptiveModels) && source.adaptiveModels.length > 0
@@ -240,12 +227,11 @@ export function augmentProviders(resolved, settings, report) {
   if (!resolved || typeof resolved !== "object" || !resolved.providers) return resolved;
   if (!resolved.providers || typeof resolved.providers !== "object") return resolved;
 
-  // A profile that named `levels` gets those everywhere; otherwise each route
-  // falls back to the set its own API can actually accept (see
-  // {@link defaultLevelsFor}).
-  const declared = settings.levelsExplicit;
-  const sharedEfforts = declared ? buildEfforts(settings) : null;
-  if (declared && Object.keys(sharedEfforts).length === 0) return resolved;
+  // One set for every route: the picker mirrors the adapter's `thinkingLevelMap`,
+  // so a per-API subset would show up as a shorter list on exactly the routes the
+  // user is trying to give levels to.
+  const efforts = buildEfforts(settings);
+  if (Object.keys(efforts).length === 0) return resolved;
 
   let clone;
   try {
@@ -275,8 +261,6 @@ export function augmentProviders(resolved, settings, report) {
       if (model.reasoningEfforts === false) continue; // explicitly a non-reasoning model
       if (model.reasoningEfforts !== undefined && !settings.overwrite) continue; // respect the profile
 
-      const efforts = sharedEfforts ?? buildEfforts({ ...settings, levels: defaultLevelsFor(route) });
-      if (Object.keys(efforts).length === 0) continue;
       model.reasoningEfforts = { ...efforts };
       // The listener runs on every config resolution, so the report is deduped
       // rather than appended to; otherwise it would grow without bound.
