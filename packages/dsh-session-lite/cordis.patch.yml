@@ -1,0 +1,17 @@
+# dsh-session-lite bundle patch.
+#
+# Adds ONE host row. The host half owns exactly one operation — deleting a session
+# from disk — because that is the only thing DSH does not already provide. Archive,
+# unarchive, open and rename are DSH features reached through the client's
+# `uiWorkspace` service, so they need no host code here.
+#
+# A patch replaces the targeted row's whole `config`, so this file contains only an
+# additive `insert` row and never restates a shipped row. `name` resolves relative
+# to this file.
+#
+# There is no `config:` block. The plugin has no settings: the delete route needs no
+# provider id, no model, and no thresholds, and a knob nothing reads is a knob that
+# silently does nothing when someone sets it.
+- insert:
+    - id: session-lite
+      name: './index.js'

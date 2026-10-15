@@ -1,0 +1,33 @@
+{
+  "name": "dsh-session-lite",
+  "version": "1.0.0",
+  "private": true,
+  "description": "精简的会话管理：侧栏底部一个按钮 + 一个弹窗，支持搜索 / 归档 / 取消归档 / 删除",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "lib"
+  ],
+  "scripts": {
+    "test": "node test/test-delete.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
+    }
+  }
+}
