@@ -101,7 +101,7 @@ DSH 侧栏插件：判断一条 API 路由**实际**在服务哪个模型。
 
 ```bash
 node test/fetch-fixtures.mjs   # 拉取参考回答夹具（16 MB，不入库）
-node test/test-detector.mjs    # 79 项
+node test/test-detector.mjs    # 97 项
 node test/test-client.mjs      # 11 项
 ```
 

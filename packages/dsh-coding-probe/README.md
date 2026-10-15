@@ -154,7 +154,7 @@
 ## 测试
 
 ```bash
-node test/test-probe.mjs    # 84 项
+node test/test-probe.mjs    # 89 项
 node test/test-client.mjs   # 11 项
 ```
 

@@ -896,7 +896,8 @@ function apply(ctx, config = {}) {
 				}
 			}),
 		`fingerprint-probe: ${ROUTE_PREFIX}/run`
-	);
+	,
+		'dsh-fingerprint-probe: run route');
 
 	// Reference-bank summary and model catalog. Kept off the run route so
 	// opening the panel never triggers a download or a detection.
@@ -971,7 +972,8 @@ function apply(ctx, config = {}) {
 				}
 			}),
 		`fingerprint-probe: ${ROUTE_PREFIX}/models`
-	);
+	,
+		'dsh-fingerprint-probe: models route');
 
 	ctx.logger?.info(
 		"fingerprint-probe: ready (provider=%s, languages=%s, reference bank %s, upstream %s@%s)",

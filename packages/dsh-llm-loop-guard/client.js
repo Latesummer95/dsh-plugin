@@ -73,7 +73,13 @@ window.__ModuleLoader__.load({
 
 			const snapshot = settings.getSnapshot();
 			const enabled = snapshot.value?.enabled !== false;
-			const error = snapshot.error ?? null;
+			// `ConfigFormSnapshot` has no `error` field — its states are
+			// `loading | ready | unavailable`. Reading a field that does not exist made
+			// this always `null`, so the warning row below could never render, and a
+			// client whose preferences are process-local (memory mode) was shown a
+			// switch that silently did nothing.
+			const unavailable = snapshot.status === "unavailable";
+			const unavailableText = "当前连接无法保存设置（可能处于内存模式），此开关不会生效。";
 
 			const onChange = async (next) => {
 				setPending(true);
@@ -96,7 +102,7 @@ window.__ModuleLoader__.load({
 					{ style: ROW_TEXT },
 					React.createElement("div", { style: ROW_TITLE }, title),
 					React.createElement("div", { style: ROW_DESC }, description),
-					error !== null && React.createElement("div", { style: ROW_ERROR }, String(error))
+					unavailable && React.createElement("div", { style: ROW_ERROR }, unavailableText)
 				),
 				React.createElement(primitives.Switch, {
 					checked: enabled,

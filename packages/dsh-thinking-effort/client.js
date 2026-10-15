@@ -56,17 +56,23 @@ window.__ModuleLoader__.load({
 
 			if (typeof settings?.getSnapshot !== "function") return null;
 
-			const enabled = settings.getSnapshot().value?.enabled !== false;
-			const error = settings.getSnapshot().error ?? null;
+			const snapshot = settings.getSnapshot();
+			const enabled = snapshot.value?.enabled !== false;
+			// `ConfigFormSnapshot` has no `error` field — its states are
+			// `loading | ready | unavailable`. Reading a field that does not exist
+			// made this always `null`, so the warning row could never render, and a
+			// client whose preferences are process-local (memory mode) or whose
+			// namespace is not exposed was shown a switch that silently did nothing.
+			const unavailable = snapshot.status === "unavailable";
 
 			const onChange = async (next) => {
 				setPending(true);
 				try {
 					await settings.set("enabled", next);
 				} catch {
-					// The transport already surfaces the failure through its snapshot
-					// error; swallowing here keeps the switch from flipping back on a
-					// rejected write while the next snapshot renders the old value.
+					// Nothing to render here: the transport reflects a rejected write
+					// by leaving the snapshot's value unchanged, and the switch is
+					// driven by that value.
 				} finally {
 					setPending(false);
 				}
@@ -122,7 +128,9 @@ window.__ModuleLoader__.load({
 			// `anthropic-messages` was the bug this replaced. The earlier copy said
 			// "Anthropic 路由的每个模型", which described the old behaviour and made a
 			// fixed plugin look unfixed.
-			description: "打开后，所有路由（不只 Anthropic）里每个模型的模型选择器都会出现完整七档思考档位：off / minimal / low / medium / high / xhigh / max。已经在 profile 里自己写了 reasoningEfforts 的模型保持不动，标了不推理的模型跳过。关闭后恢复为 profile 里自己写的配置。"
+			description: "打开后，所有路由（不只 Anthropic）里每个模型的模型选择器都会出现完整七档思考档位：off / minimal / low / medium / high / xhigh / max。已经在 profile 里自己写了 reasoningEfforts 的模型保持不动，标了不推理的模型跳过。关闭后恢复为 profile 里自己写的配置。",
+			// Shown when the settings namespace is not writable from this client.
+			unavailable: "当前连接无法保存设置（可能处于内存模式），此开关不会生效。"
 		};
 
 		/** Required services: the slot registry and the settings transport. */

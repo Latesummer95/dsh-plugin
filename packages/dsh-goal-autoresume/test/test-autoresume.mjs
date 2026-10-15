@@ -95,5 +95,52 @@ console.log("== a throwing resume is contained ==");
   check("resume failure is logged", logs.some((l) => l.includes("could not re-arm")));
 }
 
+console.log("== markers are re-read on every error ==");
+{
+  // `readConfig()` re-reads on every event so a profile edit takes effect without
+  // a restart. Deriving the markers once at mount silently ignored that reload:
+  // the plugin kept matching the markers it booted with.
+  const listeners = [];
+  const resumed = [];
+  const agent = {};
+  let entryConfig = { markers: ["MARKER-A"] };
+  const ctx = {
+    logger: { warn: () => {} },
+    loader: { entries: () => [{ fiber: { runtime: { name: "goal-autoresume" } }, options: { get config() { return entryConfig; } } }] },
+    goals: { get: () => ({ id: "g1", revision: 1 }), resume: (_t, ref) => resumed.push(ref) },
+    on: (event, fn) => { if (event === "agent/error") listeners.push(fn); }
+  };
+  apply(ctx, {});
+  const fire = (msg) => listeners.forEach((fn) => fn({ agent, error: new Error(msg) }));
+
+  fire("MARKER-A appeared");
+  check("boot-time marker matched", resumed.length === 1, `got ${resumed.length}`);
+
+  entryConfig = { markers: ["MARKER-B"] };
+  fire("MARKER-B appeared");
+  check("a reloaded marker takes effect without a restart", resumed.length === 2, `got ${resumed.length}`);
+
+  fire("MARKER-A appeared");
+  check("the replaced marker no longer matches", resumed.length === 2, `got ${resumed.length}`);
+}
+
+console.log("== a revision bump resets the budget ==");
+{
+  // A revision bump means the user edited the objective, which is a new
+  // instruction to keep going. Keying the budget on the id alone left a goal that
+  // had spent its budget disarmed forever, even after being redefined.
+  const h = harness({ goal: { id: "g1", revision: 1 }, maxAutoResumes: 1 });
+  h.fire(guardError);
+  h.fire(guardError);
+  check("budget exhausted for revision 1", h.resumed.length === 1, `got ${h.resumed.length}`);
+
+  h.setGoal({ id: "g1", revision: 2 });
+  h.fire(guardError);
+  check("a new revision gets a fresh budget", h.resumed.length === 2, `got ${h.resumed.length}`);
+  check("the resumed ref carries the new revision", h.resumed[1]?.revision === 2, JSON.stringify(h.resumed[1]));
+}
+
+console.log("")
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

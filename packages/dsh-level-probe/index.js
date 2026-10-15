@@ -827,7 +827,8 @@ export function apply(ctx, config = {}) {
 				}
 			}
 		})
-	);
+	,
+		'dsh-level-probe: catalog route');
 
 	ctx.effect(() =>
 		ctx.webServer.register({
@@ -902,7 +903,8 @@ export function apply(ctx, config = {}) {
 				sendJson(res, 202, { id: job.id, phase: job.phase, startedAt: job.startedAt });
 			}
 		})
-	);
+	,
+		'dsh-level-probe: run route');
 
 	ctx.logger?.info(
 		"level-probe: ready (provider=%s, tasks/level=%s, models-at-once=%s)",

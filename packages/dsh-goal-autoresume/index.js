@@ -80,29 +80,43 @@ function apply(ctx, config = {}) {
 		}
 	};
 
-	const markers = Array.isArray(config.markers) && config.markers.length > 0 ? config.markers : DEFAULT_MARKERS;
-	/** Per-agent auto-resume budget, keyed by the goal it was issued for. */
+	/**
+	 * Per-agent auto-resume budget.
+	 *
+	 * Keyed by goal id **and revision**, not by id alone. A revision bump means the
+	 * user edited the objective, which is a new instruction to keep going — keying on
+	 * the id would leave a goal that already spent its budget disarmed forever, even
+	 * after being redefined. It is also the pair actually passed to `resume`, so the
+	 * budget now counts attempts at the same objective rather than at the same id.
+	 */
 	const budgets = new WeakMap();
 	ctx.on("agent/error", ({ agent, error }) => {
 		const cfg = readConfig();
 		// Absent means on; any explicitly falsy value means off, for the same
 		// reason as the loop guard: the config is not always schema-validated.
 		if (cfg.enabled !== undefined && !cfg.enabled) return;
+		// Derived per event, not once at mount: `readConfig()` re-reads on every
+		// error precisely so a profile edit takes effect without a restart, and
+		// freezing the markers here would silently ignore the very reload the
+		// config read exists to support.
+		const markers = Array.isArray(cfg.markers) && cfg.markers.length > 0 ? cfg.markers : DEFAULT_MARKERS;
 		const text = renderError(error);
 		if (!markers.some((marker) => text.includes(marker))) return;
 		const goals = ctx.goals;
 		if (goals === void 0) return;
 		const goal = goals.get(agent);
 		if (goal === void 0) return;
+		const goalRevision = goal.revision ?? null;
 		let budget = budgets.get(agent);
-		if (budget === void 0 || budget.goalId !== goal.id) {
+		if (budget === void 0 || budget.goalId !== goal.id || budget.revision !== goalRevision) {
 			budget = {
 				goalId: goal.id,
+				revision: goalRevision,
 				used: 0
 			};
 			budgets.set(agent, budget);
 		}
-			const maxAutoResumes = Number.isFinite(cfg.maxAutoResumes) && cfg.maxAutoResumes > 0 ? Math.floor(cfg.maxAutoResumes) : DEFAULTS.maxAutoResumes;
+		const maxAutoResumes = Number.isFinite(cfg.maxAutoResumes) && cfg.maxAutoResumes > 0 ? Math.floor(cfg.maxAutoResumes) : DEFAULTS.maxAutoResumes;
 		if (budget.used >= maxAutoResumes) {
 			ctx.logger?.warn("goal-autoresume: goal \"%s\" already used %d auto-resumes; leaving it disarmed", goal.id, budget.used);
 			return;

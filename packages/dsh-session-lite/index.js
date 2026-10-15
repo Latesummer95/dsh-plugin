@@ -443,5 +443,6 @@ export function apply(ctx) {
 				}
 			}
 		})
-	);
+	,
+		'dsh-session-lite: delete route');
 }

@@ -1471,7 +1471,8 @@ function apply(ctx, config = {}) {
 			done.catch(() => {});
 			sendJson(res, 202, { phase: job.phase, id: job.id, startedAt: job.startedAt, ...manifest });
 		}
-	}), `coding-probe: ${ROUTE_PREFIX}/run`);
+	}), `coding-probe: ${ROUTE_PREFIX}/run`,
+		'dsh-coding-probe: run route');
 
 	// Model catalog for the panel's picker, plus the probe menu. Kept off the
 	// run route so opening the panel never triggers a battery.
@@ -1527,7 +1528,8 @@ function apply(ctx, config = {}) {
 				sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
 			}
 		}
-	}), `coding-probe: ${ROUTE_PREFIX}/models`);
+	}), `coding-probe: ${ROUTE_PREFIX}/models`,
+		'dsh-coding-probe: models route');
 
 	ctx.logger?.info(
 		"coding-probe: %d probes ready (%d control, %d target, %d complex trials), provider=%s pattern=%s",
